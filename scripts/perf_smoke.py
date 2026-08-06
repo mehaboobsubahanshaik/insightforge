@@ -9,7 +9,7 @@ Measures: 50k-row CSV upload+pipeline, dashboard hydration p50 over 20 calls,
 
 import asyncio
 import io
-import random
+import secrets
 import statistics
 import time
 
@@ -26,7 +26,7 @@ def big_csv(rows: int = 50_000) -> bytes:
     for i in range(rows):
         day = 1 + (i % 28)
         qty = 1 + (i % 9)
-        price = random.choice([49.90, 120.00, 210.00])
+        price = secrets.choice([49.90, 120.00, 210.00])
         buf.write(f"2026-06-{day:02d},Cust {i % 500},{regions[i % 4]},"
                   f"Widget {chr(65 + i % 3)},{qty},{price},{qty * price:.2f}\n")
     return buf.getvalue().encode()
