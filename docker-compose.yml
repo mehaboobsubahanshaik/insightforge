@@ -1,0 +1,66 @@
+# InsightForge — one command starts everything:
+#
+#     docker compose up --build
+#
+# Containers: insightforge (PostgreSQL), insightforge-api (FastAPI + ml),
+# insightforge-web (nginx frontend), insightforge-redis (cache/queues).
+# The API container applies database migrations automatically on boot, then
+# the app is live at http://localhost:8000 (API docs at :8001/docs).
+name: insightforge
+services:
+  postgres:
+    image: postgres:16
+    container_name: insightforge
+    environment:
+      POSTGRES_DB: insightforge
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devpassword
+    ports: ["5432:5432"]
+    volumes: [ "insightforge_pgdata:/var/lib/postgresql/data" ]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d insightforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: insightforge-redis
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: insightforge-api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:devpassword@postgres:5432/insightforge
+      REDIS_URL: redis://redis:6379/0
+      APP_SECRET: dev-change-me-in-production
+      PLATFORM_ADMIN_SECRET: platform-dev-secret
+      MAIL_OUTBOX_DIR: /srv/outbox
+    ports: ["8001:8000"]
+    volumes: [ "insightforge_outbox:/srv/outbox" ]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: insightforge-web
+    ports: ["8000:80"]
+    depends_on:
+      - api
+
+volumes:
+  insightforge_pgdata:
+  insightforge_outbox:

@@ -1,0 +1,13 @@
+order_id,order_date,customer,region,product,quantity,unit_price,total
+1001,2026-05-02,Asha Retail,South,Widget A,10,49.90,499.00
+1002,2026-05-04,Bimal Traders,North,Widget B,5,120.00,600.00
+1003,2026-05-06,Chetan & Co,South,Widget A,8,49.90,399.20
+1004,2026-05-08,Devi Stores,,Widget C,3,210.00,630.00
+1005,2026-05-10,Eshan Mart,West,Widget A,six,49.90,299.40
+1002,2026-05-04,Bimal Traders,North,Widget B,5,120.00,600.00
+1006,2026-05-12,Farhan Goods,East,Widget C,6,210.00,1260.00
+1007,2026-05-14,Gita Supplies,,Widget B,7,120.00,840.00
+1008,2026-05-16,Asha Retail,South,Widget B,2,120.00,240.00
+1009,2026-05-18,Hema Bazaar,West,Widget A,12,49.90,598.80
+1010,2026-05-20,Chetan & Co,South,Widget C,2,210.00,420.00
+1011,2026-05-22,Devi Stores,North,Widget A,9,49.90,449.10

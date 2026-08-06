@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InsightForge — Trustworthy BI for SMBs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
+<link rel="stylesheet" href="css/theme.css">
+
+</head>
+<body>
+<div id="auth">
+  <div class="hero">
+    <div class="brand"><span class="mark"><svg viewBox="0 0 24 24" fill="none"><circle cx="10.5" cy="10.5" r="6.2" stroke="#fff" stroke-width="2"/><path d="M15.5 15.5 L20 20" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/><polyline points="7,12 9.5,9.2 11.5,11 14,8" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>InsightForge</div>
+    <div>
+      <h1>Raw business data in. <em>Decisions you can trust</em> out.</h1>
+      <div class="caps">
+        <div><span class="dotc" style="background:var(--blue)"></span><span><b>Connect live to 13+ database platforms</b> — PostgreSQL, MySQL, Supabase, Neon, RDS, Cloud SQL and more — plus QuickBooks, HubSpot, Salesforce, Shopify, Stripe & GA4.</span></div>
+        <div><span class="dotc" style="background:var(--green)"></span><span><b>Every number carries evidence.</b> Type inference, quality scoring, cleaning recipes and quarantine run on every import.</span></div>
+        <div><span class="dotc" style="background:var(--amber)"></span><span><b>Self-service, governed.</b> Drag-and-drop dashboards without SQL — formulas stay inside the governed semantic layer.</span></div>
+        <div><span class="dotc" style="background:var(--pink)"></span><span><b>Distribute safely.</b> Published snapshots, expiring links, scheduled PDF reports and threshold alerts.</span></div>
+      </div>
+    </div>
+    <div class="readout">FRESHNESS · QUALITY · GOVERNED — the instrument panel for your business</div>
+  </div>
+  <div class="authpane"><div class="authcard card">
+    <div class="tabs">
+      <button id="tab-login" class="active" onclick="authTab('login')">Log in</button>
+      <button id="tab-register" onclick="authTab('register')">New org</button>
+      <button id="tab-invite" onclick="authTab('invite')">Join</button>
+    </div>
+    <form id="f-login" onsubmit="return doLogin(event)">
+      <label>Email</label><input id="li-email" type="email" required autocomplete="email">
+      <label>Password</label><input id="li-pass" type="password" required autocomplete="current-password">
+      <div id="li-otp-wrap" style="display:none"><label>MFA code</label><input id="li-otp" inputmode="numeric" autocomplete="one-time-code"></div>
+      <label>Organization slug <span style="text-transform:none">(optional)</span></label><input id="li-slug">
+      <button class="btn" style="width:100%;margin-top:1rem">Log in</button>
+      <p class="muted" style="margin-top:.7rem"><a href="#" onclick="return resetFlow()">Forgot password?</a></p>
+    </form>
+    <form id="f-register" style="display:none" onsubmit="return doRegister(event)">
+      <label>Organization name</label><input id="rg-org" required minlength="2">
+      <label>Workspace URL slug</label><input id="rg-slug" required pattern="[a-z0-9][a-z0-9-]*" placeholder="acme-co">
+      <label>Your name</label><input id="rg-name" required>
+      <label>Email</label><input id="rg-email" type="email" required>
+      <label>Password (10+ characters)</label><input id="rg-pass" type="password" minlength="10" required>
+      <button class="btn" style="width:100%;margin-top:1rem">Create organization</button>
+    </form>
+    <form id="f-invite" style="display:none" onsubmit="return doAcceptInvite(event)">
+      <label>Invitation token (from your email)</label><input id="iv-token" required>
+      <label>Your name (new accounts)</label><input id="iv-name">
+      <label>Password (new accounts, 10+ chars)</label><input id="iv-pass" type="password">
+      <button class="btn" style="width:100%;margin-top:1rem">Join organization</button>
+    </form>
+  </div></div>
+</div>
+<div id="shell">
+  <div class="topbar">
+    <div class="brand" style="font-size:1.02rem"><span class="mark"><svg viewBox="0 0 24 24" fill="none"><circle cx="10.5" cy="10.5" r="6.2" stroke="#fff" stroke-width="2"/><path d="M15.5 15.5 L20 20" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/><polyline points="7,12 9.5,9.2 11.5,11 14,8" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>InsightForge</div>
+    <span class="chip" id="chip"></span>
+    <select id="ws-switch" style="width:auto;max-width:220px;padding:.32rem .55rem;font-size:.8rem" title="Active workspace" onchange="setWorkspace(this.value)"></select>
+    <span style="flex:1"></span>
+    <button class="btn-ghost btn-sm" onclick="startTour(true)">✦ Tour</button>
+    <span class="muted" id="who"></span>
+    <span class="avatar" id="avatar">?</span>
+    <button class="btn-ghost btn-sm" onclick="logout()">Log out</button>
+  </div>
+  <div class="layout">
+    <nav class="rail" id="nav"></nav>
+    <main id="view" aria-live="polite"></main>
+  </div>
+</div>
+<div id="modal-root"></div>
+<div id="loader" role="status" aria-live="polite">
+  <div class="loadercard">
+    <svg class="lens" viewBox="0 0 96 96" fill="none">
+      <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#4F46E5"/><stop offset=".55" stop-color="#7C3AED"/><stop offset="1" stop-color="#DB2777"/></linearGradient></defs>
+      <g class="ring"><circle cx="44" cy="44" r="30" stroke="url(#lg)" stroke-width="6" stroke-linecap="round" stroke-dasharray="132 56"/></g>
+      <path d="M66 66 L84 84" stroke="url(#lg)" stroke-width="9" stroke-linecap="round"/>
+      <polyline class="trend" points="30,52 40,40 48,46 58,34" stroke="#0891B2" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle class="dot" cx="30" cy="52" r="4" fill="#4F46E5"/>
+      <circle class="dot d2" cx="48" cy="46" r="4" fill="#F59E0B"/>
+      <circle class="dot d3" cx="58" cy="34" r="4" fill="#16A34A"/>
+    </svg>
+    <div id="loader-msg">Analyzing your data…</div>
+    <div id="loader-sub">FRESHNESS · QUALITY · GOVERNED</div>
+  </div>
+</div>
+<div id="tour"><div class="veil" onclick="endTour()"></div><div class="spot" id="tour-spot"></div><div class="bubble" id="tour-bubble"></div></div>
+<script src="js/core.js"></script>
+<script src="js/home-tour.js"></script>
+<script src="js/sources.js"></script>
+<script src="js/datasets.js"></script>
+<script src="js/dashboards.js"></script>
+<script src="js/admin.js"></script>
+</body>
+</html>

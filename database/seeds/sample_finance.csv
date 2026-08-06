@@ -1,0 +1,13 @@
+txn_id,txn_date,account,category,direction,amount
+T-501,2026-04-01,Operating,Sales income,in,18500.00
+T-502,2026-04-03,Operating,Rent,out,4200.00
+T-503,2026-04-07,Operating,Sales income,in,7250.50
+T-504,2026-04-10,Payroll,Salaries,out,15600.00
+T-505,2026-04-14,Operating,Sales income,in,12900.00
+T-506,2026-04-18,Operating,Utilities,out,860.00
+T-507,2026-04-21,Operating,Sales income,in,22100.00
+T-508,2026-04-25,Operating,Marketing,out,3100.00
+T-509,2026-04-28,Payroll,Contractors,out,5400.00
+T-510,2026-05-02,Operating,Sales income,in,31600.00
+T-511,2026-05-06,Operating,Software,out,940.00
+T-512,2026-05-09,Operating,Sales income,in,4300.00

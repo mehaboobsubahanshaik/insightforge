@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shared dashboard — InsightForge</title>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
+<style>
+:root{--bg:#F4F7FB;--surface:#fff;--border:#E4EAF2;--ink:#17233B;--muted:#5B6B85;--primary:#4F46E5}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font-family:'Inter',sans-serif;padding:1.4rem}
+.wrap{max-width:1100px;margin:0 auto}
+h1{font-family:'Plus Jakarta Sans',sans-serif;font-size:1.45rem;letter-spacing:-.015em}
+.readout{font-family:'JetBrains Mono',monospace;font-size:.72rem;color:var(--muted);margin-top:.35rem}
+.readout b{color:var(--primary)}
+.banner{background:linear-gradient(93deg,#4F46E5,#7C3AED);color:#fff;border-radius:12px;padding:.55rem 1rem;font-size:.8rem;margin:1rem 0;display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+.grid{display:grid;gap:1rem;grid-template-columns:repeat(2,1fr)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.1rem;box-shadow:0 1px 2px rgba(23,35,59,.05),0 8px 24px rgba(23,35,59,.06)}
+.card.wide{grid-column:1/-1}
+.kpi{font-family:'JetBrains Mono',monospace;font-size:2rem;font-weight:600;color:#4F46E5}
+.chart{height:250px}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th{font-family:'JetBrains Mono',monospace;font-size:.66rem;text-transform:uppercase;color:var(--muted);text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--border)}
+td{padding:.4rem .6rem;border-bottom:1px solid #EEF2F8}
+td.num{text-align:right;font-family:'JetBrains Mono',monospace}
+.err{background:#FEECEC;color:#B4232F;border-radius:12px;padding:1rem;margin-top:1rem}
+@media(max-width:800px){.grid{grid-template-columns:1fr}}
+</style></head>
+<body><div class="wrap">
+<div id="head"><h1>Loading shared dashboard…</h1></div>
+<div id="content"></div>
+</div>
+<script>
+const PALETTE=['#4F46E5','#06B6D4','#16A34A','#F59E0B','#EF4444','#8B5CF6','#EC4899','#84CC16'];
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtN=x=>{const n=Number(x);return Number.isFinite(n)?n.toLocaleString(undefined,{maximumFractionDigits:2}):esc(x)};
+(async()=>{
+  const token=new URLSearchParams(location.search).get('token');
+  try{
+    const r=await fetch('/api/v1/public/dashboards/'+encodeURIComponent(token));
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail?.detail||d.detail||'Link invalid or expired')}
+    const d=await r.json();
+    document.getElementById('head').innerHTML=`<h1>${esc(d.name)}</h1>
+      <div class="readout">PUBLISHED SNAPSHOT v${d.published_version} · FRESHNESS ${d.freshness?new Date(d.freshness).toLocaleString():'—'} · QUALITY ${d.quality_score??'—'}/100</div>
+      <div class="banner"><span>🔒 Read-only snapshot shared via InsightForge — data as of publish time.</span><span>FRESHNESS · QUALITY · GOVERNED</span></div>`;
+    const c=document.getElementById('content');
+    c.innerHTML=`<div class="grid">${d.widgets.map((w,i)=>`
+      <div class="card ${w.type==='table'||w.type==='pivot'||w.width==='full'?'wide':''}"><b>${esc(w.title)}</b>
+      <div id="w-${i}" class="${w.type==='kpi'?'':'chart'}" style="margin-top:.5rem"></div></div>`).join('')}</div>`;
+    d.widgets.forEach((w,i)=>{
+      const el=document.getElementById('w-'+i);
+      if(w.error){el.innerHTML=`<p style="color:#B4232F">${esc(w.error)}</p>`;return}
+      if(w.type==='kpi'){el.innerHTML=`<div class="kpi">${w.value===null?'—':fmtN(w.value)}</div>`;return}
+      if(w.type==='table'){
+        el.innerHTML=`<div style="overflow:auto;max-height:340px"><table><thead><tr>${w.columns.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead>
+        <tbody>${w.rows.map(r=>`<tr>${w.columns.map(x=>`<td class="${typeof r[x]==='number'?'num':''}">${typeof r[x]==='number'?fmtN(r[x]):esc(r[x])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;return}
+      if(w.type==='pivot'){const p=w.pivot;
+        el.innerHTML=`<div style="overflow:auto;max-height:340px"><table><thead><tr><th></th>${p.cols.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead>
+        <tbody>${p.rows.map((rk,ri)=>`<tr><td><b>${esc(rk)}</b></td>${p.cells[ri].map(v=>`<td class="num">${v===null?'—':fmtN(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;return}
+      const ch=echarts.init(el);
+      const cats=(w.groups||[]).map(r=>r.group),vals=(w.groups||[]).map(r=>r.value);
+      const base={grid:{left:52,right:14,top:20,bottom:32},
+        xAxis:{type:'category',data:cats,axisLabel:{fontSize:10}},yAxis:{type:'value',axisLabel:{fontSize:10}}};
+      if(w.type==='bar')ch.setOption({...base,series:[{type:'bar',barMaxWidth:44,
+        data:vals.map((v,j)=>({value:v,itemStyle:{color:PALETTE[j%PALETTE.length],borderRadius:[6,6,0,0]}}))}]});
+      else if(w.type==='line'||w.type==='area')ch.setOption({...base,series:[{type:'line',data:vals,smooth:true,
+        lineStyle:{width:3,color:'#4F46E5'},itemStyle:{color:'#7C3AED'},
+        areaStyle:w.type==='area'?{color:'rgba(79,70,229,.2)'}:undefined}]});
+      else ch.setOption({series:[{type:'pie',radius:w.type==='donut'?['42%','70%']:'70%',
+        itemStyle:{borderRadius:7,borderColor:'#fff',borderWidth:2},label:{fontSize:10},
+        data:(w.groups||[]).map((r,j)=>({name:r.group,value:r.value,itemStyle:{color:PALETTE[j%PALETTE.length]}}))}]});
+      new ResizeObserver(()=>ch.resize()).observe(el)});
+  }catch(e){document.getElementById('head').innerHTML='<h1>Shared dashboard</h1>';
+    document.getElementById('content').innerHTML=`<div class="err">${esc(e.message)}</div>`}
+})();
+</script></body></html>

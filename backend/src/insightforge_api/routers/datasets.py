@@ -1,0 +1,458 @@
+"""Dataset catalog, uploads (CSV/XLSX through the trust pipeline), preview
+with quarantine drill-through, quality trend, semantic measures, alerts,
+neutralized CSV export, lineage."""
+
+import csv
+import io
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import desc, select
+
+from .. import audit
+from ..deps import TenantContext, get_session, require
+from ..models import (
+    AlertRule,
+    Connection,
+    Dataset,
+    DatasetRow,
+    DQHistory,
+    DQResult,
+    Measure,
+    Workspace,
+)
+from ..services import entitlements, ingest, querysvc
+from ..services.formulas import FormulaError, compile_formula
+from ..services.reportsvc import neutralize_csv_cell, safe_filename
+from .auth import _uuid_or_422
+
+router = APIRouter(prefix="/api/v1/datasets", tags=["datasets"])
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+
+
+async def _dataset_or_404(session, ctx, dataset_id) -> Dataset:
+    did = _uuid_or_422(dataset_id, "dataset_id")
+    ds = (await session.execute(select(Dataset).where(
+        Dataset.id == did, Dataset.tenant_id == ctx.tenant_id,
+        Dataset.archived.is_(False)))).scalar_one_or_none()
+    if ds is None:
+        raise HTTPException(404, "Dataset not found")
+    return ds
+
+
+def _dataset_out(ds: Dataset, connection_name: str | None = None) -> dict:
+    return {"id": str(ds.id), "workspace_id": str(ds.workspace_id), "name": ds.name,
+            "source_type": ds.source_type,
+            "connection_id": str(ds.connection_id) if ds.connection_id else None,
+            "connection_name": connection_name, "schema": ds.schema_def,
+            "row_count": ds.row_count, "quarantined_count": ds.quarantined_count,
+            "quality_score": ds.quality_score, "profile": ds.profile,
+            "ingested_at": ds.ingested_at.isoformat() if ds.ingested_at else None,
+            "current_import_id": str(ds.current_import_id) if ds.current_import_id else None}
+
+
+@router.get("")
+async def catalog(ctx: TenantContext = Depends(require("dataset:read")),
+                  session=Depends(get_session)):
+    rows = (await session.execute(
+        select(Dataset, Connection.name)
+        .join(Connection, Connection.id == Dataset.connection_id, isouter=True)
+        .where(Dataset.tenant_id == ctx.tenant_id, Dataset.archived.is_(False))
+        .order_by(desc(Dataset.created_at)))).all()
+    return [_dataset_out(ds, cname) for ds, cname in rows]
+
+
+@router.post("/upload", status_code=201)
+async def upload(request: Request, file: UploadFile, workspace_id: str = Query(...),
+                 name: str = Query(..., min_length=1, max_length=255),
+                 ctx: TenantContext = Depends(require("dataset:create")),
+                 session=Depends(get_session)):
+    wid = _uuid_or_422(workspace_id, "workspace_id")
+    ws = (await session.execute(select(Workspace).where(
+        Workspace.id == wid, Workspace.tenant_id == ctx.tenant_id))).scalar_one_or_none()
+    if ws is None:
+        raise HTTPException(404, "Workspace not found")
+    await entitlements.enforce_quota(session, ctx.tenant_id, "datasets", Dataset,
+                                     (Dataset.tenant_id == ctx.tenant_id)
+                                     & Dataset.archived.is_(False))
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File is larger than 15 MB — split it or use a connector")
+    fname = (file.filename or "").lower()
+    try:
+        if fname.endswith((".xlsx", ".xlsm")):
+            headers, rows = ingest.parse_xlsx(content)
+        else:
+            headers, rows = ingest.parse_csv(content)
+        pipeline = ingest.run_pipeline(headers, rows)
+    except ingest.IngestError as e:
+        raise HTTPException(422, str(e)) from None
+
+    from ..models import uuid7
+
+    ds = Dataset(tenant_id=ctx.tenant_id, workspace_id=wid, name=name, source_type="upload",
+                 created_by=ctx.user_id)
+    session.add(ds)
+    await session.flush()
+    import_id = uuid7()
+    for bucket, quarantined in ((pipeline["records"], False), (pipeline["quarantined"], True)):
+        for rec in bucket:
+            session.add(DatasetRow(tenant_id=ctx.tenant_id, dataset_id=ds.id,
+                                   import_id=import_id, row_index=rec["row_index"],
+                                   data=rec["data"], is_quarantined=quarantined,
+                                   quarantine_reason=rec["reason"]))
+    for dq in pipeline["dq"]:
+        session.add(DQResult(tenant_id=ctx.tenant_id, dataset_id=ds.id, import_id=import_id,
+                             rule=dq["rule"], severity=dq["severity"],
+                             affected=dq["affected"], detail=dq["detail"]))
+    session.add(DQHistory(tenant_id=ctx.tenant_id, dataset_id=ds.id,
+                          score=pipeline["quality_score"], row_count=pipeline["row_count"],
+                          quarantined_count=pipeline["quarantined_count"]))
+    from datetime import datetime, timezone
+
+    ds.schema_def = pipeline["schema"]
+    ds.row_count = pipeline["row_count"]
+    ds.quarantined_count = pipeline["quarantined_count"]
+    ds.quality_score = pipeline["quality_score"]
+    ds.profile = pipeline["profile"]
+    ds.current_import_id = import_id
+    ds.ingested_at = datetime.now(timezone.utc)
+    await entitlements.meter(session, ctx.tenant_id, "upload.rows", pipeline["row_count"])
+    await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
+                       action="dataset.uploaded", resource_type="dataset",
+                       resource_id=str(ds.id),
+                       detail={"rows": pipeline["row_count"],
+                               "quarantined": pipeline["quarantined_count"]},
+                       correlation_id=ctx.correlation_id)
+    await session.commit()
+    return _dataset_out(ds)
+
+
+@router.get("/{dataset_id}")
+async def detail(dataset_id: str, ctx: TenantContext = Depends(require("dataset:read")),
+                 session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    dq = (await session.execute(select(DQResult).where(
+        DQResult.dataset_id == ds.id,
+        DQResult.import_id == ds.current_import_id))).scalars()
+    out = _dataset_out(ds)
+    out["dq_results"] = [{"rule": r.rule, "severity": r.severity, "affected": r.affected,
+                          "detail": r.detail} for r in dq]
+    out["lineage"] = {"source": ds.source_type, "connection_id":
+                      str(ds.connection_id) if ds.connection_id else None,
+                      "import_id": str(ds.current_import_id) if ds.current_import_id else None,
+                      "ingested_at": out["ingested_at"]}
+    return out
+
+
+@router.get("/{dataset_id}/preview")
+async def preview(dataset_id: str, limit: int = 50, include_quarantined: bool = False,
+                  filters: str | None = None,
+                  ctx: TenantContext = Depends(require("dataset:read")),
+                  session=Depends(get_session)):
+    """Preview / drill-through: `filters` is a JSON array of
+    {column, op, value} — the same shape dashboards use, enabling
+    "view underlying rows" from any chart segment."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    parsed = []
+    if filters:
+        import json as _json
+        try:
+            parsed = _json.loads(filters)
+            assert isinstance(parsed, list)
+        except Exception:  # noqa: BLE001
+            raise HTTPException(422, "filters must be a JSON array") from None
+    return await querysvc.fetch_table(
+        session, dataset_id=ds.id, current_import_id=ds.current_import_id,
+        dataset_schema=ds.schema_def, limit=limit,
+        include_quarantined=include_quarantined, filters=parsed)
+
+
+@router.get("/{dataset_id}/dq-history")
+async def dq_history(dataset_id: str, ctx: TenantContext = Depends(require("dataset:read")),
+                     session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    rows = (await session.execute(select(DQHistory).where(DQHistory.dataset_id == ds.id)
+                                  .order_by(DQHistory.recorded_at).limit(200))).scalars()
+    return [{"score": h.score, "row_count": h.row_count,
+             "quarantined_count": h.quarantined_count,
+             "at": h.recorded_at.isoformat()} for h in rows]
+
+
+@router.patch("/{dataset_id}")
+async def archive_or_rename(dataset_id: str, body: dict,
+                            ctx: TenantContext = Depends(require("dataset:create")),
+                            session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    if "name" in body:
+        ds.name = str(body["name"])[:255]
+    if body.get("archived") is True:
+        ds.archived = True
+        await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
+                           action="dataset.archived", resource_type="dataset",
+                           resource_id=str(ds.id))
+    await session.commit()
+    return _dataset_out(ds)
+
+
+@router.get("/{dataset_id}/export.csv")
+async def export_csv(dataset_id: str, ctx: TenantContext = Depends(require("dataset:export")),
+                     session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    table = await querysvc.fetch_table(
+        session, dataset_id=ds.id, current_import_id=ds.current_import_id,
+        dataset_schema=ds.schema_def, limit=querysvc.TABLE_LIMIT)
+    await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
+                       action="dataset.exported", resource_type="dataset",
+                       resource_id=str(ds.id))
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(table["columns"])
+    for row in table["rows"]:
+        writer.writerow([neutralize_csv_cell(row.get(c)) for c in table["columns"]])
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="{safe_filename(ds.name, "csv")}"'})
+
+
+# ---------------- AI insights (ml/ package) ----------------
+@router.get("/{dataset_id}/insights")
+async def insights(dataset_id: str, value_column: str, date_column: str,
+                   horizon: int = 6,
+                   ctx: TenantContext = Depends(require("dataset:read")),
+                   session=Depends(get_session)):
+    """Forecast + anomaly detection over a governed dataset series.
+
+    Aggregates `value_column` (sum) per `date_column`, ordered, from the
+    current import's clean rows — the same trust boundary every widget uses —
+    then runs the insightforge_ml models. Facts, forecasts and anomalies are
+    labelled distinctly so the UI can present them honestly.
+    """
+    from insightforge_ml import detect_anomalies, forecast_series
+
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    cols = {c["name"]: c["inferred_type"] for c in ds.schema_def}
+    if value_column not in cols or cols[value_column] not in ("number", "integer"):
+        raise HTTPException(422, f"value_column must be a numeric column "
+                                 f"(got {value_column!r})")
+    if date_column not in cols:
+        raise HTTPException(422, f"date_column {date_column!r} is not in this dataset")
+    rows_q = (await session.execute(select(DatasetRow).where(
+        DatasetRow.dataset_id == ds.id,
+        DatasetRow.import_id == ds.current_import_id,
+        DatasetRow.is_quarantined.is_(False)))).scalars().all()
+    buckets: dict[str, float] = {}
+    for r in rows_q:
+        key = str(r.data.get(date_column, "") or "")
+        try:
+            val = float(str(r.data.get(value_column, "") or "").replace(",", ""))
+        except ValueError:
+            continue
+        if key:
+            buckets[key] = buckets.get(key, 0.0) + val
+    labels = sorted(buckets)
+    series = [round(buckets[k], 4) for k in labels]
+    out = {"dataset_id": str(ds.id), "value_column": value_column,
+           "date_column": date_column, "series": [
+               {"label": k, "value": v} for k, v in zip(labels, series)],
+           "freshness": ds.ingested_at.isoformat(),
+           "quality_score": ds.quality_score}
+    try:
+        out["forecast"] = forecast_series(series, horizon=horizon)
+    except ValueError as e:
+        out["forecast"] = {"error": str(e)}
+    try:
+        out["anomalies"] = detect_anomalies(series, labels=labels)
+    except ValueError as e:
+        out["anomalies"] = {"error": str(e)}
+    return out
+
+
+# ---------------- Cleaning recipes ----------------
+class RecipeIn(BaseModel):
+    steps: list
+
+
+@router.get("/{dataset_id}/recipe")
+async def get_recipe(dataset_id: str, ctx: TenantContext = Depends(require("dataset:read")),
+                     session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    return {"steps": ds.recipe,
+            "ops": sorted(ingest.RECIPE_OPS)}
+
+
+@router.post("/{dataset_id}/recipe/apply")
+async def apply_recipe(dataset_id: str, body: RecipeIn,
+                       ctx: TenantContext = Depends(require("dataset:create")),
+                       session=Depends(get_session)):
+    """Apply cleaning steps to ALL rows of the current import (including
+    quarantined ones — cleaning is how you rescue them), then re-run the full
+    trust pipeline into a new generation: types re-inferred, DQ re-scored,
+    lineage advanced. The recipe is saved on the dataset."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    headers = [c["name"] for c in ds.schema_def]
+    try:
+        steps = ingest.validate_recipe(body.steps, headers)
+    except ingest.IngestError as e:
+        raise HTTPException(422, str(e)) from None
+    rows_q = (await session.execute(select(DatasetRow).where(
+        DatasetRow.dataset_id == ds.id,
+        DatasetRow.import_id == ds.current_import_id)
+        .order_by(DatasetRow.row_index))).scalars().all()
+    raw = [[str(r.data.get(h, "") or "") for h in headers] for r in rows_q]
+    cleaned = ingest.apply_recipe(headers, raw, steps)
+    pipeline = ingest.run_pipeline(headers, cleaned)
+
+    from ..models import uuid7
+    import_id = uuid7()
+    for bucket, quarantined in ((pipeline["records"], False),
+                                (pipeline["quarantined"], True)):
+        for rec in bucket:
+            session.add(DatasetRow(tenant_id=ctx.tenant_id, dataset_id=ds.id,
+                                   import_id=import_id, row_index=rec["row_index"],
+                                   data=rec["data"], is_quarantined=quarantined,
+                                   quarantine_reason=rec["reason"]))
+    for dq in pipeline["dq"]:
+        session.add(DQResult(tenant_id=ctx.tenant_id, dataset_id=ds.id,
+                             import_id=import_id, rule=dq["rule"],
+                             severity=dq["severity"], affected=dq["affected"],
+                             detail=dq["detail"]))
+    session.add(DQHistory(tenant_id=ctx.tenant_id, dataset_id=ds.id,
+                          score=pipeline["quality_score"],
+                          row_count=pipeline["row_count"],
+                          quarantined_count=pipeline["quarantined_count"]))
+    from datetime import datetime, timezone
+    ds.schema_def = pipeline["schema"]
+    ds.row_count = pipeline["row_count"]
+    ds.quarantined_count = pipeline["quarantined_count"]
+    ds.quality_score = pipeline["quality_score"]
+    ds.profile = pipeline["profile"]
+    ds.recipe = steps
+    ds.current_import_id = import_id
+    ds.ingested_at = datetime.now(timezone.utc)
+    await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
+                       action="dataset.recipe_applied", resource_type="dataset",
+                       resource_id=str(ds.id), detail={"steps": len(steps)})
+    await session.commit()
+    return _dataset_out(ds)
+
+
+# ---------------- Semantic layer: governed measures ----------------
+class MeasureIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    formula: str = Field(min_length=1, max_length=500)
+    description: str = Field(default="", max_length=500)
+    certified: bool = False
+
+
+@router.get("/{dataset_id}/measures")
+async def list_measures(dataset_id: str, ctx: TenantContext = Depends(require("dataset:read")),
+                        session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    rows = (await session.execute(select(Measure).where(Measure.dataset_id == ds.id)
+                                  .order_by(Measure.created_at))).scalars()
+    return [{"id": str(m.id), "name": m.name, "formula": m.formula,
+             "description": m.description, "certified": m.certified} for m in rows]
+
+
+@router.post("/{dataset_id}/measures", status_code=201)
+async def create_measure(dataset_id: str, body: MeasureIn,
+                         ctx: TenantContext = Depends(require("measure:create")),
+                         session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    try:
+        compile_formula(body.formula, ds.schema_def)
+    except FormulaError as e:
+        raise HTTPException(422, f"Formula error: {e}") from None
+    m = Measure(tenant_id=ctx.tenant_id, dataset_id=ds.id, name=body.name,
+                formula=body.formula, description=body.description,
+                certified=body.certified, created_by=ctx.user_id)
+    session.add(m)
+    await session.flush()
+    await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
+                       action="measure.created", resource_type="measure", resource_id=str(m.id),
+                       detail={"formula": body.formula})
+    await session.commit()
+    return {"id": str(m.id), "name": m.name, "formula": m.formula, "certified": m.certified}
+
+
+@router.get("/{dataset_id}/measures/{measure_id}/result")
+async def measure_result(dataset_id: str, measure_id: str, group_by: str | None = None,
+                         ctx: TenantContext = Depends(require("dataset:read")),
+                         session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    mid = _uuid_or_422(measure_id, "measure_id")
+    m = (await session.execute(select(Measure).where(
+        Measure.id == mid, Measure.dataset_id == ds.id))).scalar_one_or_none()
+    if m is None:
+        raise HTTPException(404, "Measure not found")
+    try:
+        return await querysvc.execute_formula(
+            session, dataset_id=ds.id, current_import_id=ds.current_import_id,
+            dataset_schema=ds.schema_def, formula=m.formula, group_by=group_by)
+    except querysvc.QueryError as e:
+        raise HTTPException(422, str(e)) from None
+
+
+# ---------------- Threshold alerts ----------------
+class AlertIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    formula: str = Field(min_length=1, max_length=500)
+    operator: str
+    threshold: float
+    interval_minutes: int = Field(default=60, ge=1)
+    recipients: list[str] = []
+
+
+@router.get("/{dataset_id}/alerts")
+async def list_alerts(dataset_id: str, ctx: TenantContext = Depends(require("dataset:read")),
+                      session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    rows = (await session.execute(select(AlertRule).where(
+        AlertRule.dataset_id == ds.id))).scalars()
+    return [{"id": str(a.id), "name": a.name, "formula": a.formula, "operator": a.operator,
+             "threshold": a.threshold, "interval_minutes": a.interval_minutes,
+             "enabled": a.enabled, "last_state": a.last_state,
+             "recipients": a.recipients} for a in rows]
+
+
+@router.post("/{dataset_id}/alerts", status_code=201)
+async def create_alert(dataset_id: str, body: AlertIn,
+                       ctx: TenantContext = Depends(require("measure:create")),
+                       session=Depends(get_session)):
+    if body.operator not in ("gt", "gte", "lt", "lte"):
+        raise HTTPException(422, "operator must be gt, gte, lt, or lte")
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    try:
+        compile_formula(body.formula, ds.schema_def)
+    except FormulaError as e:
+        raise HTTPException(422, f"Formula error: {e}") from None
+    await entitlements.enforce_quota(session, ctx.tenant_id, "alerts", AlertRule,
+                                     AlertRule.tenant_id == ctx.tenant_id)
+    await entitlements.enforce_min_interval(session, ctx.tenant_id, body.interval_minutes)
+    rule = AlertRule(tenant_id=ctx.tenant_id, dataset_id=ds.id, name=body.name,
+                     formula=body.formula, operator=body.operator, threshold=body.threshold,
+                     interval_minutes=body.interval_minutes, recipients=body.recipients,
+                     created_by=ctx.user_id)
+    session.add(rule)
+    await session.flush()
+    await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
+                       action="alert.created", resource_type="alert", resource_id=str(rule.id))
+    await session.commit()
+    return {"id": str(rule.id), "name": rule.name}
+
+
+@router.patch("/{dataset_id}/alerts/{alert_id}")
+async def toggle_alert(dataset_id: str, alert_id: str, body: dict,
+                       ctx: TenantContext = Depends(require("measure:create")),
+                       session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    aid = _uuid_or_422(alert_id, "alert_id")
+    rule = (await session.execute(select(AlertRule).where(
+        AlertRule.id == aid, AlertRule.dataset_id == ds.id))).scalar_one_or_none()
+    if rule is None:
+        raise HTTPException(404, "Alert not found")
+    if "enabled" in body:
+        rule.enabled = bool(body["enabled"])
+    await session.commit()
+    return {"id": str(rule.id), "enabled": rule.enabled}

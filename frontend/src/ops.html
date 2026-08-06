@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InsightForge — Platform operations</title>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#F4F7FB;--surface:#fff;--border:#E4EAF2;--ink:#17233B;--muted:#5B6B85;--primary:#4F46E5;--red:#EF4444;--green:#16A34A}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font-family:'Inter',sans-serif;padding:1.4rem}
+.wrap{max-width:1150px;margin:0 auto}
+h1{font-family:'Plus Jakarta Sans',sans-serif;letter-spacing:-.015em;font-size:1.4rem}
+.sub{color:var(--muted);font-size:.85rem;margin:.3rem 0 1.1rem}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.1rem;box-shadow:0 1px 2px rgba(23,35,59,.05),0 8px 24px rgba(23,35,59,.06)}
+input{background:#fff;border:1px solid var(--border);border-radius:10px;padding:.55rem .8rem;font-family:'JetBrains Mono',monospace;width:280px}
+button{cursor:pointer;border:none;border-radius:10px;font-weight:600;font-size:.82rem;padding:.5rem .9rem;font-family:'Inter',sans-serif}
+.btn{background:linear-gradient(93deg,#4F46E5,#7C3AED);color:#fff}
+.ghost{background:#fff;border:1px solid var(--border);color:var(--ink)}
+.danger{background:#FEF1F2;color:var(--red);border:1px solid #FBD5D9}
+table{width:100%;border-collapse:collapse;font-size:.85rem;margin-top:.8rem}
+th{font-family:'JetBrains Mono',monospace;font-size:.66rem;text-transform:uppercase;color:var(--muted);text-align:left;padding:.5rem .6rem;border-bottom:1px solid var(--border)}
+td{padding:.48rem .6rem;border-bottom:1px solid #EEF2F8}
+td.num{text-align:right;font-family:'JetBrains Mono',monospace}
+.pill{display:inline-block;padding:.14rem .55rem;border-radius:99px;font-size:.66rem;font-weight:700;text-transform:uppercase}
+.pill.active{background:#E7F7EE;color:var(--green)}.pill.suspended{background:#FEECEC;color:var(--red)}
+.warn{color:var(--red);font-family:'JetBrains Mono',monospace}
+.row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}
+</style></head>
+<body><div class="wrap">
+<h1>🛠 Platform operations</h1>
+<p class="sub">Cross-tenant operator console. Requires the platform secret (dev default: <code>platform-dev-secret</code>). Shows statuses and counts only — never tenant row data or credentials.</p>
+<div class="card"><div class="row">
+  <input id="secret" type="password" placeholder="X-Platform-Secret">
+  <button class="btn" onclick="load()">Load tenants</button>
+  <span id="status" style="color:var(--muted);font-size:.8rem"></span>
+</div>
+<div id="out"></div></div>
+</div>
+<script>
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function call(path,opts={}){
+  const r=await fetch('/api/v1/platform'+path,{...opts,
+    headers:{'X-Platform-Secret':document.getElementById('secret').value,
+      ...(opts.json?{'Content-Type':'application/json'}:{})},
+    body:opts.json?JSON.stringify(opts.json):undefined});
+  if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail?.detail||d.detail||('HTTP '+r.status))}
+  return r.json()}
+async function load(){
+  const st=document.getElementById('status');st.textContent='Loading…';
+  try{const ts=await call('/tenants');st.textContent=ts.length+' tenants';
+    document.getElementById('out').innerHTML=`<table><thead><tr>
+      <th>Tenant</th><th>Plan</th><th>Status</th><th>Members</th><th>Datasets</th><th>Dashboards</th><th>Connections</th><th>Failed runs</th><th>Created</th><th></th></tr></thead>
+      <tbody>${ts.map(t=>`<tr>
+        <td><b>${esc(t.name)}</b> <span style="color:var(--muted)">(${esc(t.slug)})</span></td>
+        <td>${esc(t.plan_code)}</td>
+        <td><span class="pill ${t.status}">${t.status}</span></td>
+        <td class="num">${t.members}</td><td class="num">${t.datasets}</td>
+        <td class="num">${t.dashboards}</td><td class="num">${t.connections}</td>
+        <td class="num ${t.failed_runs?'warn':''}">${t.failed_runs}</td>
+        <td style="color:var(--muted)">${new Date(t.created_at).toLocaleDateString()}</td>
+        <td>${t.status==='active'
+          ?`<button class="danger" onclick="setStatus('${t.id}','suspended')">Suspend</button>`
+          :`<button class="ghost" onclick="setStatus('${t.id}','active')">Reactivate</button>`}</td>
+      </tr>`).join('')}</tbody></table>`}
+  catch(e){st.textContent='';document.getElementById('out').innerHTML=`<p style="color:var(--red);margin-top:.8rem">${esc(e.message)}</p>`}}
+async function setStatus(id,status){
+  try{await call('/tenants/'+id+'/status',{method:'POST',json:{status}});load()}
+  catch(e){alert(e.message)}}
+document.getElementById('secret').addEventListener('keydown',e=>{if(e.key==='Enter')load()});
+</script></body></html>
