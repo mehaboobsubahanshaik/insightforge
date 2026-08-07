@@ -15,6 +15,8 @@ session tokens, platform secret.
 | Platform console abuse | secret header, counts-only responses, audit events | `routers/platform.py` |
 | Request flooding / oversized bodies | request-size guard middleware, upload caps | `main.py` |
 | Share-link scraping | random 128-bit tokens, expiry enforced server-side | `routers/dashboards.py` |
+| Stored XSS via tenant data | every render path escapes through `esc()`; no `innerHTML` of raw values; CSP-friendly single-origin app | `frontend/src/js/core.js` (esc), all view files |
+| CSRF | no cookie auth: bearer token sent via `Authorization` header only, so cross-site form posts carry no credentials; state-changing routes reject missing/invalid JWT | `routers/auth.py`, `deps.py` |
 
 Out of MVP scope (documented, not ignored): per-tenant KMS keys, SSO/SAML,
 IP allowlists, row-level *user* permissions inside a tenant, DDoS (assumed at
