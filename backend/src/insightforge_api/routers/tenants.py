@@ -126,6 +126,7 @@ async def change_role(membership_id: str, body: RolePatch,
     await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
                        action="member.role_changed", resource_type="membership",
                        resource_id=str(mid), detail={"role": body.role})
+    await session.commit()  # persist the role change before responding
     return {"membership_id": str(mid), "role": body.role}
 
 

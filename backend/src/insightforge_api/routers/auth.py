@@ -212,6 +212,7 @@ async def verify_email(body: VerifyIn, ctx: TenantContext = Depends(get_context)
     await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
                        action="user.email_verified", resource_type="user",
                        resource_id=str(ctx.user_id))
+    await session.commit()  # persist before responding (teardown commit runs post-response)
     return {"email_verified": True}
 
 
@@ -293,6 +294,7 @@ async def change_password(body: ChangePasswordIn, ctx: TenantContext = Depends(g
     await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
                        action="user.password_changed", resource_type="user",
                        resource_id=str(ctx.user_id))
+    await session.commit()  # persist before responding (teardown commit runs post-response)
     return {"status": "password_updated"}
 
 
@@ -323,6 +325,7 @@ async def update_me(body: ProfilePatch, ctx: TenantContext = Depends(get_context
                     session=Depends(get_session)):
     user = (await session.execute(select(User).where(User.id == ctx.user_id))).scalar_one()
     user.display_name = body.display_name
+    await session.commit()  # persist before responding (teardown commit runs post-response)
     return ProfileOut(user_id=str(user.id), email=user.email, display_name=user.display_name,
                       role=ctx.role, tenant_id=str(ctx.tenant_id),
                       mfa_enabled=user.mfa_enabled, email_verified=user.email_verified)
@@ -336,6 +339,7 @@ async def mfa_setup(ctx: TenantContext = Depends(get_context), session=Depends(g
     secret = new_totp_secret()
     user.mfa_secret = secret
     uri = (f"otpauth://totp/InsightForge:{user.email}?secret={secret}&issuer=InsightForge")
+    await session.commit()  # persist the MFA secret before responding
     return {"secret": secret, "otpauth_uri": uri}
 
 
@@ -353,6 +357,7 @@ async def mfa_enable(body: MfaEnableIn, ctx: TenantContext = Depends(get_context
     await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
                        action="user.mfa_enabled", resource_type="user",
                        resource_id=str(ctx.user_id))
+    await session.commit()  # persist before responding (teardown commit runs post-response)
     return {"mfa_enabled": True}
 
 

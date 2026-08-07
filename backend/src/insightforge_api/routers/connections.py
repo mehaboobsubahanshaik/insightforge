@@ -168,10 +168,12 @@ async def sync_now(connection_id: str, body: SyncIn,
         await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
                            action="sync.failed", resource_type="connection",
                            resource_id=str(conn.id))
+        await session.commit()  # persist failure bookkeeping before responding
         raise HTTPException(502, f"Sync failed: {str(e)[:300]}") from None
     if run.status == "failed":
         conn.consecutive_failures += 1
         conn.last_error = run.error
+        await session.commit()  # persist before responding (teardown commit runs post-response)
         return {"run_id": str(run.id), "status": run.status, "error": run.error}
     conn.consecutive_failures = 0
     conn.last_error = ""
@@ -179,6 +181,7 @@ async def sync_now(connection_id: str, body: SyncIn,
                        action="sync.completed", resource_type="connection",
                        resource_id=str(conn.id),
                        detail={"status": run.status, "rows_loaded": run.rows_loaded})
+    await session.commit()  # persist the sync run + dataset before responding
     return {"run_id": str(run.id), "status": run.status,
             "rows_extracted": run.rows_extracted, "rows_loaded": run.rows_loaded,
             "dataset_id": str(run.dataset_id) if run.dataset_id else None}
@@ -209,6 +212,7 @@ async def set_schedule(connection_id: str, body: ScheduleIn,
                        resource_id=str(conn.id),
                        detail={"interval_minutes": body.interval_minutes,
                                "enabled": body.enabled})
+    await session.commit()  # persist the schedule before responding
     return {"connection_id": str(conn.id), "interval_minutes": schedule.interval_minutes,
             "enabled": schedule.enabled, "next_run_at": schedule.next_run_at.isoformat()}
 
