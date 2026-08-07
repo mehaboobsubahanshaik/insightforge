@@ -43,6 +43,10 @@ jobs:
           pip install -e "./backend[dev]"
       - name: Lint (ruff over backend, ml, scripts)
         run: cd backend && python -m ruff check src tests ../ml ../scripts
+      - name: Dependency security scan (fails on known CVEs)
+        run: |
+          pip install pip-audit
+          pip-audit --strict --skip-editable
       - name: Frontend syntax (node --check every feature file)
         run: for f in frontend/src/js/*.js; do node --check "$f"; done
       - name: Migrations up (and cycle check)
