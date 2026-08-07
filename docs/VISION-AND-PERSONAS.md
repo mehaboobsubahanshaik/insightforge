@@ -35,3 +35,13 @@ dirty, stale, and unexplained. Our differentiators, in priority order:
 3. Multi-tenancy is a database property (RLS), not an application habit.
 4. Workspaces mirror how SMBs think: one project's documents in one place.
 5. Boring, explainable models before clever, opaque ones.
+## Success metrics (MVP horizon)
+* **Activation**: % of new tenants reaching a published dashboard in ≤ 1 day
+  (the checklist on Home instruments exactly this funnel).
+* **Trust engagement**: % of weekly-active tenants that open lineage or the
+  quarantine view — proves the differentiator is used, not decorative.
+* **Data health**: median dataset quality score after first recipe ≥ 90.
+* **Retention proxy**: tenants with ≥ 1 scheduled report or alert (recurring
+  value delivery) — target 40% of paying tenants.
+* **Expansion lever**: % of Starter tenants hitting the sync-interval floor
+  (the designed upgrade trigger to Growth).
