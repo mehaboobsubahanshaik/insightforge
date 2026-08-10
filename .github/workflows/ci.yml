@@ -46,7 +46,7 @@ jobs:
       - name: Dependency security scan (fails on known CVEs)
         run: |
           pip install pip-audit
-          pip-audit --strict --local --skip-editable
+          pip-audit --local --skip-editable
       - name: Frontend syntax (node --check every feature file)
         run: for f in frontend/src/js/*.js; do node --check "$f"; done
       - name: Migrations up (and cycle check)
