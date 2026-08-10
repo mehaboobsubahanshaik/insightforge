@@ -10,7 +10,8 @@ RUN pip install --no-cache-dir /srv/ml
 # backend package
 COPY backend/pyproject.toml /srv/backend/pyproject.toml
 COPY backend/src /srv/backend/src
-RUN pip install --no-cache-dir /srv/backend
+COPY backend/tests /srv/backend/tests
+RUN pip install --no-cache-dir "/srv/backend[dev]"
 
 # migrations live in the database/ folder; alembic.ini points at them
 COPY backend/alembic.ini /srv/backend/alembic.ini

@@ -97,7 +97,8 @@ async function vSettings(){
       <hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">
       <h3>Multi-factor authentication</h3>
       <p class="muted" style="margin:.3rem 0 .6rem">Status: ${me.mfa_enabled?'<span class="pill published">enabled</span>':'<span class="pill draft">disabled</span>'}</p>
-      ${me.mfa_enabled?'<p class="muted" style="font-size:.78rem">MFA protects this account on every login.</p>'
+      ${me.mfa_enabled?`<p class="muted" style="font-size:.78rem">MFA protects this account on every login. If you lose your authenticator, sign in with a recovery code instead of the 6-digit code.</p>
+        <button class="btn-ghost btn-sm" onclick="regenRecovery()">Regenerate recovery codes</button>`
         :`<button class="btn" onclick="enrollMfa()">Enable MFA</button>`}
     </div>
     <div class="card"><h3>Organization</h3>
@@ -123,8 +124,23 @@ async function enrollMfa(){
       <button class="btn" onclick="confirmMfa()">Confirm</button></div>`)}
   catch(e){toast(e.message,true)}}
 async function confirmMfa(){
-  try{await api('/auth/mfa/enable',{method:'POST',json:{otp:$('#mfa-code').value}});
-    S.me=await api('/auth/me');closeModal();toast('MFA enabled');go('settings')}
+  try{const d=await api('/auth/mfa/enable',{method:'POST',json:{otp:$('#mfa-code').value}});
+    S.me=await api('/auth/me');showRecoveryCodes(d.recovery_codes,'MFA enabled');go('settings')}
+  catch(e){toast(e.message,true)}}
+function showRecoveryCodes(codes,title){
+  modal(`<h3>${title} — save your recovery codes</h3>
+  <p class="muted" style="margin:.3rem 0 .6rem">Each code signs you in <b>once</b> if you lose your
+  authenticator. They are shown <b>only now</b> — store them in your password manager.</p>
+  <div class="mono" style="columns:2;padding:.6rem;border:1px solid var(--border);border-radius:8px;font-size:.85rem;line-height:1.7">
+    ${codes.map(c=>`<div>${c}</div>`).join('')}</div>
+  <div class="row" style="justify-content:flex-end;margin-top:1rem;gap:.5rem">
+    <button class="btn-ghost" onclick="navigator.clipboard.writeText('${codes.join('\\n')}').then(()=>toast('Copied'))">Copy all</button>
+    <button class="btn" onclick="closeModal()">I saved them</button></div>`)}
+async function regenRecovery(){
+  const pw=prompt('Confirm your account password to replace ALL recovery codes:');
+  if(!pw)return;
+  try{const d=await withLoader(()=>api('/auth/mfa/recovery-codes',{method:'POST',json:{password:pw}}));
+    showRecoveryCodes(d.recovery_codes,'New recovery codes')}
   catch(e){toast(e.message,true)}}
 /* ---- scheduled reports: per published dashboard ---- */
 async function openReports(){

@@ -85,7 +85,7 @@ async function doLogin(ev){ev.preventDefault();
     const d=await withLoader(()=>api('/auth/login',{method:'POST',json:body}));
     S.token=d.access_token;S.refresh=d.refresh_token;saveSession();enter()}
   catch(e){
-    if(e.status===428){$('#li-otp-wrap').style.display='block';toast('Enter your MFA code');return false}
+    if(e.status===428){$('#li-otp-wrap').style.display='block';toast('Enter your 6-digit MFA code — or a recovery code if you lost your authenticator');return false}
     toast(e.message,true)}return false}
 async function doRegister(ev){ev.preventDefault();
   try{const d=await withLoader(()=>api('/auth/register',{method:'POST',json:{

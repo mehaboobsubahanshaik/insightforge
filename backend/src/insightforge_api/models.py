@@ -50,6 +50,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     mfa_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mfa_recovery_codes: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     email_verify_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reset_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)

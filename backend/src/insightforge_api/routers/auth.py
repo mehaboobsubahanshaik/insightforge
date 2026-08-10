@@ -19,10 +19,12 @@ from ..deps import TenantContext, get_context, get_session
 from ..models import Invitation, Membership, RefreshToken, Tenant, User, Workspace
 from ..roles import ROLES, TENANT_OWNER
 from ..security import (
+    consume_recovery_code,
     decode_access_token,
     hash_password,
     issue_access_token,
     new_opaque_token,
+    new_recovery_codes,
     new_totp_secret,
     sha256_of,
     totp_verify,
@@ -121,12 +123,25 @@ async def login(body: LoginIn, request: Request):
                 select(User).where(User.email == body.email.lower()))).scalar_one_or_none()
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(401, "Email or password is incorrect")
+    used_recovery = False
     if user.mfa_enabled:
         if not body.otp:
             raise HTTPException(428, "MFA code required")
         if not totp_verify(user.mfa_secret or "", body.otp):
-            raise HTTPException(401, "MFA code is incorrect")
+            remaining = consume_recovery_code(user.mfa_recovery_codes, body.otp)
+            if remaining is None:
+                raise HTTPException(401, "MFA code is incorrect")
+            used_recovery = True
+            # also update the detached object: it is merge()d into the
+            # token-issuing session later, and must carry the consumed list
+            # rather than writing the stale one back.
+            user.mfa_recovery_codes = remaining
     async with user_scoped_session(user.id) as s:
+        if used_recovery:
+            # one-time use: persist the consumed list before issuing tokens
+            u = (await s.execute(select(User).where(User.id == user.id))).scalar_one()
+            u.mfa_recovery_codes = remaining
+            await s.flush()
         memberships = (await s.execute(
             select(Membership).where(Membership.user_id == user.id))).scalars().all()
         if not memberships:
@@ -146,7 +161,9 @@ async def login(body: LoginIn, request: Request):
         merged_user = await s.merge(user)
         out = await _issue_pair(s, merged_user, tenant, chosen.role)
         await audit.record(s, tenant_id=tenant.id, actor_user_id=user.id,
-                           action="user.login", resource_type="user", resource_id=str(user.id),
+                           action=("user.login_recovery_code" if used_recovery
+                               else "user.login"),
+                       resource_type="user", resource_id=str(user.id),
                            correlation_id=getattr(request.state, "correlation_id", ""))
         return out
 
@@ -354,11 +371,40 @@ async def mfa_enable(body: MfaEnableIn, ctx: TenantContext = Depends(get_context
     if not user.mfa_secret or not totp_verify(user.mfa_secret, body.otp):
         raise HTTPException(400, "MFA code is incorrect — scan the secret and try again")
     user.mfa_enabled = True
+    plain, hashes = new_recovery_codes()
+    user.mfa_recovery_codes = hashes
     await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
                        action="user.mfa_enabled", resource_type="user",
                        resource_id=str(ctx.user_id))
     await session.commit()  # persist before responding (teardown commit runs post-response)
-    return {"mfa_enabled": True}
+    return {"mfa_enabled": True, "recovery_codes": plain,
+            "recovery_note": "Store these now — they are shown only once. "
+                             "Each code signs you in once if you lose your authenticator."}
+
+
+class MfaRecoveryRegenIn(BaseModel):
+    password: str
+
+
+@router.post("/mfa/recovery-codes")
+async def mfa_regenerate_recovery(body: MfaRecoveryRegenIn,
+                                  ctx: TenantContext = Depends(get_context),
+                                  session=Depends(get_session)):
+    """Invalidate all remaining recovery codes and mint a fresh set of 10.
+    Requires the account password (not TOTP) so a user who signed in WITH a
+    recovery code after losing their device can restock."""
+    user = (await session.execute(select(User).where(User.id == ctx.user_id))).scalar_one()
+    if not user.mfa_enabled:
+        raise HTTPException(409, "MFA is not enabled")
+    if not verify_password(body.password, user.password_hash):
+        raise HTTPException(401, "Password is incorrect")
+    plain, hashes = new_recovery_codes()
+    user.mfa_recovery_codes = hashes
+    await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
+                       action="user.mfa_recovery_regenerated", resource_type="user",
+                       resource_id=str(ctx.user_id))
+    await session.commit()  # persist before responding (teardown commit runs post-response)
+    return {"recovery_codes": plain, "remaining": len(plain)}
 
 
 class AcceptInviteIn(BaseModel):
@@ -430,3 +476,38 @@ def _uuid_or_422(value: str, label: str) -> uuid.UUID:
 
 
 __all__ = ["router", "decode_access_token", "_validate_role", "_uuid_or_422"]
+
+# --- MFA recovery codes -----------------------------------------------------
+# 10 one-time codes, format XXXX-XXXX from an unambiguous alphabet (no 0/O,
+# 1/I/L). Only SHA-256 hashes are stored; comparison is timing-safe.
+
+_RECOVERY_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+
+def _normalize_recovery(code: str) -> str:
+    return code.replace("-", "").replace(" ", "").strip().upper()
+
+
+def hash_recovery_code(code: str) -> str:
+    return hashlib.sha256(_normalize_recovery(code).encode()).hexdigest()
+
+
+def new_recovery_codes(n: int = 10) -> tuple[list[str], list[str]]:
+    """Returns (plaintext_codes, hashes). Plaintext is shown once, never stored."""
+    plain = []
+    for _ in range(n):
+        raw = "".join(secrets.choice(_RECOVERY_ALPHABET) for _ in range(8))
+        plain.append(f"{raw[:4]}-{raw[4:]}")
+    return plain, [hash_recovery_code(c) for c in plain]
+
+
+def consume_recovery_code(stored_hashes: list | None, candidate: str) -> list | None:
+    """If candidate matches a stored hash, return the list WITHOUT it (consumed).
+    Returns None when there is no match."""
+    if not stored_hashes:
+        return None
+    cand = hash_recovery_code(candidate)
+    for h in stored_hashes:
+        if secrets.compare_digest(h, cand):
+            return [x for x in stored_hashes if x != h]
+    return None
