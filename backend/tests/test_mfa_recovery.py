@@ -1,10 +1,9 @@
 """MFA recovery codes: minted at enable, one-time login use, regeneration."""
 
 import pytest
+from conftest import PASSWORD, register_and_login
 
 from insightforge_api.security import totp_now
-
-from conftest import PASSWORD, register_and_login
 
 pytestmark = pytest.mark.anyio
 

@@ -477,37 +477,3 @@ def _uuid_or_422(value: str, label: str) -> uuid.UUID:
 
 __all__ = ["router", "decode_access_token", "_validate_role", "_uuid_or_422"]
 
-# --- MFA recovery codes -----------------------------------------------------
-# 10 one-time codes, format XXXX-XXXX from an unambiguous alphabet (no 0/O,
-# 1/I/L). Only SHA-256 hashes are stored; comparison is timing-safe.
-
-_RECOVERY_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
-
-
-def _normalize_recovery(code: str) -> str:
-    return code.replace("-", "").replace(" ", "").strip().upper()
-
-
-def hash_recovery_code(code: str) -> str:
-    return hashlib.sha256(_normalize_recovery(code).encode()).hexdigest()
-
-
-def new_recovery_codes(n: int = 10) -> tuple[list[str], list[str]]:
-    """Returns (plaintext_codes, hashes). Plaintext is shown once, never stored."""
-    plain = []
-    for _ in range(n):
-        raw = "".join(secrets.choice(_RECOVERY_ALPHABET) for _ in range(8))
-        plain.append(f"{raw[:4]}-{raw[4:]}")
-    return plain, [hash_recovery_code(c) for c in plain]
-
-
-def consume_recovery_code(stored_hashes: list | None, candidate: str) -> list | None:
-    """If candidate matches a stored hash, return the list WITHOUT it (consumed).
-    Returns None when there is no match."""
-    if not stored_hashes:
-        return None
-    cand = hash_recovery_code(candidate)
-    for h in stored_hashes:
-        if secrets.compare_digest(h, cand):
-            return [x for x in stored_hashes if x != h]
-    return None
