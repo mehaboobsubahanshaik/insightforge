@@ -21,7 +21,11 @@ OUTBOX_DIR = pathlib.Path(tempfile.gettempdir()) / "if_test_outbox"
 os.environ["MAIL_OUTBOX_DIR"] = str(OUTBOX_DIR)
 os.environ.pop("SMTP_HOST", None)
 
-ADMIN_DSN = "postgresql://postgres:devpassword@127.0.0.1:5432/insightforge"
+# Hosts are overridable so the suite runs both on a dev machine (localhost
+# services) and inside the compose api container (service-name hosts).
+PG_HOST = os.environ.get("TEST_PG_HOST", "127.0.0.1")
+MYSQL_HOST = os.environ.get("TEST_MYSQL_HOST", "127.0.0.1")
+ADMIN_DSN = f"postgresql://postgres:devpassword@{PG_HOST}:5432/insightforge"
 PASSWORD = "correct-horse-battery"
 TABLES = [
     "audit_events", "meter_readings", "billing_events", "email_outbox", "alert_events",
@@ -41,7 +45,7 @@ CLEAN_CSV = (
 )  # sum(total)=2642.32; South=1794.90
 
 
-def _ensure_service(port: int, start_cmd: list[str]):
+def _ensure_service(host: str, port: int, start_cmd: list[str]):
     """Best-effort: start a local backing service if it isn't listening
     (dev sandboxes stop services between runs). No-op when unavailable."""
     import socket
@@ -49,20 +53,26 @@ def _ensure_service(port: int, start_cmd: list[str]):
 
     with socket.socket() as s:
         s.settimeout(0.5)
-        if s.connect_ex(("127.0.0.1", port)) == 0:
-            return
+        try:
+            if s.connect_ex((host, port)) == 0:
+                return
+        except OSError:
+            pass
     try:
         subprocess.run(start_cmd, capture_output=True, timeout=30, check=False)  # noqa: S603 - fixed dev-service commands
     except Exception:  # noqa: BLE001, S110 - best effort only
         pass
 
 
-def _port_open(port: int) -> bool:
+def _port_open(host: str, port: int) -> bool:
     import socket
 
-    with socket.socket() as s:
-        s.settimeout(0.7)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+    try:
+        with socket.socket() as s:
+            s.settimeout(0.7)
+            return s.connect_ex((host, port)) == 0
+    except OSError:  # unresolvable host = service not available
+        return False
 
 
 MYSQL_AVAILABLE = False
@@ -116,7 +126,7 @@ async def _seed_mysql_demo_shop():
     the mariadb service container env)."""
     import aiomysql
 
-    conn = await aiomysql.connect(host="127.0.0.1", port=3306, db="demo_shop_mysql",
+    conn = await aiomysql.connect(host=MYSQL_HOST, port=3306, db="demo_shop_mysql",
                                   user="demo", password="devpassword")
     async with conn.cursor() as cur:
         await cur.execute("DROP TABLE IF EXISTS shop_orders")
@@ -132,8 +142,8 @@ async def _seed_mysql_demo_shop():
 
 @pytest.fixture(scope="session", autouse=True)
 def _provision():
-    _ensure_service(5432, ["pg_ctlcluster", "16", "main", "start"])
-    _ensure_service(3306, ["service", "mariadb", "start"])
+    _ensure_service(PG_HOST, 5432, ["pg_ctlcluster", "16", "main", "start"])
+    _ensure_service(MYSQL_HOST, 3306, ["service", "mariadb", "start"])
 
     async def setup():
         conn = await asyncpg.connect(ADMIN_DSN)
@@ -141,7 +151,7 @@ def _provision():
         await conn.close()
         await _seed_pg_demo_shop()
         global MYSQL_AVAILABLE
-        if _port_open(3306):
+        if _port_open(MYSQL_HOST, 3306):
             try:
                 await _seed_mysql_demo_shop()
                 MYSQL_AVAILABLE = True

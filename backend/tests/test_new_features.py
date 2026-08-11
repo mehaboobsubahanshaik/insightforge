@@ -3,7 +3,16 @@ filters, platform operator console."""
 
 import conftest  # noqa: F401 - referenced lazily inside the skipif expression
 import pytest
-from conftest import ADMIN_DSN, PASSWORD, auth, get_workspace, register_and_login, upload_csv
+from conftest import (
+    ADMIN_DSN,
+    MYSQL_HOST,
+    PASSWORD,
+    PG_HOST,
+    auth,
+    get_workspace,
+    register_and_login,
+    upload_csv,
+)
 
 needs_mysql = pytest.mark.skipif(
     "not conftest.MYSQL_AVAILABLE",
@@ -11,7 +20,7 @@ needs_mysql = pytest.mark.skipif(
            "one-line docker command)")
 
 MYSQL_CONN = {"connector_type": "mariadb", "name": "mysql shop",
-              "config": {"host": "127.0.0.1", "port": "3306",
+              "config": {"host": MYSQL_HOST, "port": "3306",
                          "database": "demo_shop_mysql", "table": "shop_orders",
                          "cursor_column": "id"},
               "credentials": {"user": "demo", "password": "devpassword"}}
@@ -51,7 +60,7 @@ async def test_mysql_live_incremental_cycle(client):
     r = await client.post(f"/api/v1/connections/{cid}/sync", headers=auth(tok),
                           json={"mode": "incremental"})
     assert r.json()["status"] == "no_change"
-    conn = await aiomysql.connect(host="127.0.0.1", port=3306, db="demo_shop_mysql",
+    conn = await aiomysql.connect(host=MYSQL_HOST, port=3306, db="demo_shop_mysql",
                                   user="demo", password="devpassword")
     async with conn.cursor() as cur:
         await cur.execute(
@@ -64,7 +73,7 @@ async def test_mysql_live_incremental_cycle(client):
                           json={"mode": "incremental"})
     d = r.json()
     assert d["status"] == "succeeded" and d["rows_extracted"] == 1 and d["rows_loaded"] == 13
-    conn = await aiomysql.connect(host="127.0.0.1", port=3306, db="demo_shop_mysql",
+    conn = await aiomysql.connect(host=MYSQL_HOST, port=3306, db="demo_shop_mysql",
                                   user="demo", password="devpassword")
     async with conn.cursor() as cur:
         await cur.execute("DELETE FROM shop_orders WHERE customer='Delta Buyer'")
@@ -96,7 +105,7 @@ async def test_pg_alias_platform_works(client):
     ws = await get_workspace(client, tok)
     r = await client.post("/api/v1/connections", headers=auth(tok), json={
         "workspace_id": ws, "name": "via supabase tile", "connector_type": "supabase",
-        "config": {"host": "127.0.0.1", "port": "5432", "database": "demo_shop",
+        "config": {"host": PG_HOST, "port": "5432", "database": "demo_shop",
                    "table": "shop_orders", "cursor_column": "id", "sslmode": "disable"},
         "credentials": {"user": "postgres", "password": "devpassword"}})
     assert r.status_code == 201, r.text

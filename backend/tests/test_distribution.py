@@ -1,4 +1,5 @@
-"""Scheduler outcomes: report delivery, alert fire/recover, failure backoff."""
+"""Scheduler outcomes: report delivery + quick retry, alert fire/recover,
+sync failure backoff + owner notification."""
 
 import uuid
 
@@ -135,3 +136,72 @@ async def test_scheduled_sync_failure_backoff_and_heal(client):
     assert await run_due_schedules_once() == 1
     conns = (await client.get("/api/v1/connections", headers=auth(tok))).json()
     assert conns[0]["consecutive_failures"] == 0 and conns[0]["health"] == "healthy"
+
+
+async def test_sync_failure_streak_notifies_owner_once(client):
+    from insightforge_api.scheduler import NOTIFY_AFTER_FAILURES, run_due_schedules_once
+
+    tok = await register_and_login(client, slug="notif", email="owner@notif.dev")
+    conn_info = await make_pg_connection(client, tok)
+    await client.post(f"/api/v1/connections/{conn_info['id']}/sync", headers=auth(tok),
+                      json={"mode": "incremental"})
+    await client.put(f"/api/v1/connections/{conn_info['id']}/schedule", headers=auth(tok),
+                     json={"interval_minutes": 1440})
+    admin = await asyncpg.connect(ADMIN_DSN)
+    await admin.execute(
+        "UPDATE connections SET config = jsonb_set(config, '{database}', "
+        "'\"no_such_db\"') WHERE id = $1", uuid.UUID(conn_info["id"]))
+    await admin.close()
+    for i in range(NOTIFY_AFTER_FAILURES + 1):  # one past the threshold
+        await _rewind("sync_schedules", "next_run_at")
+        assert await run_due_schedules_once() == 1
+    notices = [b for b in outbox_bodies() if "keeps failing" in b]
+    assert len(notices) == 1  # exactly once per streak, not per failure
+    assert "owner@notif.dev" in notices[0] and "no_such_db" in notices[0]
+
+
+async def test_report_failure_gets_one_quick_retry(client):
+    from unittest.mock import patch
+
+    from insightforge_api.scheduler import run_due_reports_once
+
+    tok = await register_and_login(client, slug="retry", email="owner@retry.dev")
+    ws = await get_workspace(client, tok)
+    ds = await upload_csv(client, tok, ws)
+    r = await client.post("/api/v1/dashboard-templates/sales_overview/apply",
+                          headers=auth(tok), json={
+                              "workspace_id": ws, "dataset_id": ds["id"],
+                              "value_column": "total", "category_column": "region",
+                              "date_column": "order_date"})
+    dash = r.json()
+    await client.post(f"/api/v1/dashboards/{dash['id']}/publish", headers=auth(tok))
+    r = await client.post(f"/api/v1/dashboards/{dash['id']}/report-schedules",
+                          headers=auth(tok),
+                          json={"recipients": ["ceo@retry.dev"],
+                                "interval_minutes": 1440})
+    assert r.status_code == 201
+
+    def boom(*a, **k):
+        raise RuntimeError("renderer exploded")
+
+    await _rewind("report_schedules", "next_run_at")
+    with patch("insightforge_api.scheduler.render_dashboard_pdf", side_effect=boom):
+        await run_due_reports_once()
+    scheds = (await client.get(f"/api/v1/dashboards/{dash['id']}/report-schedules",
+                               headers=auth(tok))).json()
+    assert scheds[0]["last_status"] == "retrying"
+
+    # retry also fails -> gives up until next full interval
+    await _rewind("report_schedules", "next_run_at")
+    with patch("insightforge_api.scheduler.render_dashboard_pdf", side_effect=boom):
+        await run_due_reports_once()
+    scheds = (await client.get(f"/api/v1/dashboards/{dash['id']}/report-schedules",
+                               headers=auth(tok))).json()
+    assert scheds[0]["last_status"] == "failed"
+
+    # renderer healthy again -> next scheduled run sends normally
+    await _rewind("report_schedules", "next_run_at")
+    assert await run_due_reports_once() == 1
+    scheds = (await client.get(f"/api/v1/dashboards/{dash['id']}/report-schedules",
+                               headers=auth(tok))).json()
+    assert scheds[0]["last_status"] == "sent"

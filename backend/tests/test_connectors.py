@@ -1,9 +1,9 @@
 """Connector framework: PostgreSQL end-to-end incremental sync, SaaS sandbox
 demos, security validation, schema drift, plan floors."""
 
-from conftest import ADMIN_DSN, auth, get_workspace, register_and_login
+from conftest import ADMIN_DSN, PG_HOST, auth, get_workspace, register_and_login
 
-PG_CONFIG = {"host": "127.0.0.1", "port": "5432", "database": "demo_shop",
+PG_CONFIG = {"host": PG_HOST, "port": "5432", "database": "demo_shop",
              "table": "shop_orders", "cursor_column": "id"}
 PG_CREDS = {"user": "postgres", "password": "devpassword"}
 

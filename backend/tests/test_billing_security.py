@@ -3,9 +3,17 @@ restricted app_user role, problem-details contract, ops endpoints."""
 
 import asyncpg
 import pytest
-from conftest import ADMIN_DSN, PASSWORD, auth, get_workspace, register_and_login, upload_csv
+from conftest import (
+    ADMIN_DSN,
+    PASSWORD,
+    PG_HOST,
+    auth,
+    get_workspace,
+    register_and_login,
+    upload_csv,
+)
 
-APP_DSN = "postgresql://app_user:app_dev_password@127.0.0.1:5432/insightforge"
+APP_DSN = f"postgresql://app_user:app_dev_password@{PG_HOST}:5432/insightforge"
 
 
 async def test_dataset_quota_and_archive_frees_slot(client):
@@ -135,7 +143,7 @@ async def test_ops_endpoints_and_diagnostics_secret_free(client):
     # create a pg connection so credentials exist in the vault
     r = await client.post("/api/v1/connections", headers=auth(tok), json={
         "workspace_id": ws, "name": "Shop DB", "connector_type": "postgresql",
-        "config": {"host": "127.0.0.1", "port": 5432, "database": "demo_shop",
+        "config": {"host": PG_HOST, "port": 5432, "database": "demo_shop",
                    "table": "shop_orders", "cursor_column": "id"},
         "credentials": {"user": "postgres", "password": "devpassword"}})
     assert r.status_code == 201, r.text
