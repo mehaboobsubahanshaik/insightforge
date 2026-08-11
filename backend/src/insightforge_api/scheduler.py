@@ -23,13 +23,34 @@ from .models import (
     ReportSchedule,
     SyncRun,
     SyncSchedule,
+    User,
 )
 from .services import entitlements, mailer, querysvc, syncsvc
 from .services.reportsvc import render_dashboard_pdf
 
 log = logging.getLogger("insightforge.scheduler")
 MAX_BACKOFF_MULTIPLIER = 8
+NOTIFY_AFTER_FAILURES = 3  # email the connection owner once at this streak
+REPORT_RETRY_MINUTES = 10  # one quick retry before waiting a full interval
 
+async def _notify_sync_failures(s, tenant_id, conn):
+    """At exactly NOTIFY_AFTER_FAILURES consecutive failures, tell the owner —
+    once per streak, so a flapping connector cannot spam anyone."""
+    if conn.consecutive_failures != NOTIFY_AFTER_FAILURES:
+        return
+    owner = (await s.execute(select(User).where(
+        User.id == conn.created_by))).scalar_one_or_none()
+    if owner is None:
+        return
+    await mailer.send(
+        s, tenant_id=tenant_id, to_email=owner.email, kind="sync_failure",
+        subject=f"InsightForge: sync for '{conn.name}' keeps failing",
+        body=(f"The scheduled sync for connection '{conn.name}' has failed "
+              f"{conn.consecutive_failures} times in a row.\n"
+              f"Last error: {conn.last_error}\n\n"
+              "Retries continue automatically with increasing delays. Open "
+              "Sources in InsightForge to fix the connection or run a manual "
+              "sync once it's resolved — a successful sync resets everything."))
 
 async def _due(model, when_col):
     async with session_factory()() as s:
@@ -62,6 +83,7 @@ async def run_due_schedules_once() -> int:
                     backoff = min(2 ** conn.consecutive_failures, MAX_BACKOFF_MULTIPLIER)
                     schedule.next_run_at = now + timedelta(
                         minutes=schedule.interval_minutes * backoff)
+                    await _notify_sync_failures(s, tenant_id, conn)
                 else:
                     conn.consecutive_failures = 0
                     conn.last_error = ""
@@ -83,6 +105,7 @@ async def run_due_schedules_once() -> int:
                 schedule.last_run_at = now
                 schedule.next_run_at = now + timedelta(
                     minutes=schedule.interval_minutes * backoff)
+                await _notify_sync_failures(s, tenant_id, conn)
                 s.add(SyncRun(tenant_id=tenant_id, connection_id=conn.id,
                               mode="incremental", trigger="scheduled", status="failed",
                               error=str(e)[:1000], finished_at=now))
@@ -128,7 +151,14 @@ async def run_due_reports_once() -> int:
                 ran += 1
             except Exception as e:  # noqa: BLE001
                 log.warning("report %s failed: %s", report_id, e)
-                report.last_status = "failed"
+                if report.last_status == "retrying":
+                    # the quick retry also failed: give up until next interval
+                    report.last_status = "failed"
+                else:
+                    # first failure: one fast retry before a full interval wait
+                    report.last_status = "retrying"
+                    report.next_run_at = now + timedelta(
+                        minutes=min(REPORT_RETRY_MINUTES, report.interval_minutes))
     return ran
 
 

@@ -80,6 +80,7 @@ async function renderDash(){
     ${canEdit?`<button class="btn-ghost" onclick="openAddWidget()">+ Widget</button>
     <button class="btn-ghost" onclick="openVersions()">Versions</button>
     <button class="btn-ghost" onclick="publishDash()">${DB.published_version?'Republish':'Publish'}</button>`:''}
+    <button class="btn-ghost" onclick="openViews()">👁 Views</button>
     <button class="btn-ghost" onclick="openComments()">💬 Comments</button>
     ${DB.published_version?`<button class="btn" onclick="openShare()">Share</button>`:''}
   </div></div>
@@ -262,4 +263,50 @@ async function makeShare(){
   catch(e){toast(e.message,true)}}
 async function revokeShare(id){
   try{await api(`/shares/${id}/revoke`,{method:'POST'});openShare()}
+  catch(e){toast(e.message,true)}}
+
+/* ---- Saved views: personal & shared filter sets on a dashboard ---- */
+let VLIST=[];
+async function openViews(){
+  try{VLIST=await withLoader(()=>api(`/dashboards/${DB.id}/views`));renderViewsModal()}
+  catch(e){toast(e.message,true)}}
+function renderViewsModal(){
+  const canAdmin=['tenant_owner','tenant_admin'].includes(S.me.role);
+  modal(`<h3>👁 Saved views</h3>
+  <p class="muted" style="margin:.3rem 0 .8rem">A view is a saved set of filters on this dashboard —
+  keep it personal, or share it so the whole team sees the same slice.</p>
+  ${VLIST.length?VLIST.map((v,i)=>`
+    <div class="row between" style="padding:.45rem 0;border-bottom:1px solid var(--border)">
+      <span><b>${esc(v.name)}</b>
+        <span class="pill ${v.shared?'published':'draft'}">${v.shared?'team':'personal'}</span>
+        <span class="muted" style="font-size:.78rem">${v.filters.length?v.filters.map(f=>esc(f.column)+' = '+esc(f.value)).join(' · '):'no filters (reset)'}</span></span>
+      <span class="row">
+        <button class="btn-ghost btn-sm" onclick="applyView(${i})">Apply</button>
+        ${v.mine||canAdmin?`<button class="btn-ghost btn-sm" onclick="toggleViewShared(${i})">${v.shared?'Make personal':'Share with team'}</button>
+        <button class="btn-ghost btn-sm" onclick="archiveView(${i})">Remove</button>`:''}
+      </span></div>`).join('')
+    :`<p class="muted">No saved views yet.</p>`}
+  <label style="margin-top:1rem">Save current filters as a view
+    <span class="muted" style="font-size:.78rem">(${XF.length?XF.length+' active filter'+(XF.length>1?'s':''):'none — saves a "show everything" reset view'})</span></label>
+  <div class="row"><input id="view-name" placeholder="e.g. South region only" style="flex:1">
+    <label class="row" style="gap:.3rem;font-size:.85rem"><input type="checkbox" id="view-shared"> team</label>
+    <button class="btn" onclick="saveView()">Save</button></div>
+  <div class="row" style="justify-content:flex-end;margin-top:1rem">
+    <button class="btn-ghost" onclick="closeModal()">Close</button></div>`)}
+async function saveView(){
+  const name=$('#view-name').value.trim();if(!name){toast('Give the view a name',true);return}
+  try{await api(`/dashboards/${DB.id}/views`,{method:'POST',
+      json:{name,filters:XF,shared:$('#view-shared').checked}});
+    toast(`View “${name}” saved`);openViews()}
+  catch(e){toast(e.message,true)}}
+function applyView(i){XF=(VLIST[i].filters||[]).map(f=>({...f}));closeModal();renderDash();
+  toast(`View “${VLIST[i].name}” applied`)}
+async function toggleViewShared(i){
+  try{await api(`/dashboards/${DB.id}/views/${VLIST[i].id}`,{method:'PATCH',
+      json:{shared:!VLIST[i].shared}});openViews()}
+  catch(e){toast(e.message,true)}}
+async function archiveView(i){
+  if(!confirm(`Remove view “${VLIST[i].name}”?`))return;
+  try{await api(`/dashboards/${DB.id}/views/${VLIST[i].id}`,{method:'PATCH',
+      json:{archived:true}});openViews()}
   catch(e){toast(e.message,true)}}
