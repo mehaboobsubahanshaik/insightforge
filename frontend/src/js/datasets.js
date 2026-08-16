@@ -1,15 +1,28 @@
 /* Datasets: list, detail, preview+drill, lineage, cleaning recipes, AI insights.
    Edit here for: dataset views, recipe ops UX, quality trend, forecasts/anomalies. */
 /* ============ datasets: list, detail, recipe, drill ============ */
+let DSQ='';
 async function vDatasets(){
-  const rows=wsFilter(await api('/datasets'));
+  const all=wsFilter(await api('/datasets'));
+  const q=DSQ.trim().toLowerCase();
+  const rows=q?all.filter(d=>d.name.toLowerCase().includes(q)
+    ||d.source_type.toLowerCase().includes(q)
+    ||wsName(d.workspace_id).toLowerCase().includes(q)):all;
   $('#view').innerHTML=`<div class="pagehead"><div><h2>Datasets</h2>
   <p class="muted">${S.ws==='all'?'All workspaces':'📁 '+esc(wsName(S.ws))} — every dataset carries its trust evidence.</p></div>
-  <button class="btn" onclick="openUpload()">Upload CSV / Excel</button></div>
-  ${rows.length===0?`<div class="card" style="text-align:center;padding:3rem">
+  <span class="row" style="gap:.5rem">
+  <input id="ds-search" placeholder="🔍 Search name, source, workspace…" value="${esc(DSQ)}"
+    oninput="DSQ=this.value;clearTimeout(window._dsq);window._dsq=setTimeout(()=>{const p=this.selectionStart;vDatasets().then(()=>{const el=$('#ds-search');el.focus();el.setSelectionRange(p,p)})},250)"
+    style="min-width:230px">
+  <button class="btn" onclick="openUpload()">Upload CSV / Excel</button></span></div>
+  ${rows.length===0?(q?`<div class="card" style="text-align:center;padding:3rem">
+    <div style="font-size:2.2rem">🔍</div><h3 style="margin:.5rem 0">No datasets match “${esc(DSQ)}”</h3>
+    <p class="muted">Try a different term, or clear the search.</p>
+    <button class="btn-ghost" style="margin-top:1rem" onclick="DSQ='';vDatasets()">Clear search</button></div>`
+  :`<div class="card" style="text-align:center;padding:3rem">
     <div style="font-size:2.2rem">🗃️</div><h3 style="margin:.5rem 0">No datasets ${S.ws==='all'?'yet':'in this workspace yet'}</h3>
     <p class="muted">Connect a source or upload a spreadsheet to land your first one.</p>
-    <button class="btn" style="margin-top:1rem" onclick="go('sources')">Open data sources</button></div>`
+    <button class="btn" style="margin-top:1rem" onclick="go('sources')">Open data sources</button></div>`)
   :`<div class="grid cards stagger">${rows.map(d=>{
     const q=d.quality_score??100;
     const qc=q>=90?'var(--green)':q>=70?'var(--amber)':'var(--red)';
@@ -43,6 +56,7 @@ async function renderDataset(){
   </div>
   <div class="row">
     <button class="btn-ghost" onclick="openRecipe()">🧼 Clean data</button>
+    <button class="btn-ghost" onclick="openSuggestions()">✨ Suggest fixes</button>
     <button class="btn-ghost" onclick="openLineage()">Lineage</button>
     <button class="btn-ghost" onclick="openInsights()">✨ AI insights</button>
     <button class="btn" onclick="exportDs('${DS.id}')">Export CSV</button>
@@ -50,6 +64,15 @@ async function renderDataset(){
   ${DRILL.length?`<div class="row" style="margin-bottom:.8rem">${DRILL.map((f,i)=>
     `<span class="filter-chip">${esc(f.column)} ${f.op} ${esc(f.value)}<button onclick="DRILL.splice(${i},1);renderDataset()">✕</button></span>`).join('')}
     <button class="btn-ghost btn-sm" onclick="DRILL=[];renderDataset()">Clear drill</button></div>`:''}
+  <div class="card" style="margin-bottom:1rem">
+    <div class="row between"><h3>💬 Ask this dataset</h3>
+      <span class="muted" style="font-size:.75rem">grounded in your columns & certified measures — never a guess</span></div>
+    <div class="row" style="margin-top:.5rem">
+      <input id="ask-q" placeholder='e.g. "total by region", "average quantity last month", "top 3 products by total"'
+        style="flex:1" onkeydown="if(event.key==='Enter')runAsk()">
+      <button class="btn" onclick="runAsk()">Ask</button></div>
+    <div id="ask-out"></div>
+  </div>
   <div class="grid two" style="margin-bottom:1rem">
     <div class="card"><h3>Data quality checks</h3>
       ${dq.length===0?'<p class="muted" style="margin-top:.5rem">All checks green on the current import.</p>'
@@ -221,4 +244,90 @@ async function runInsights(){
           {name:'forecast',type:'line',data:fcData,symbolSize:6,
             lineStyle:{width:3,type:'dashed',color:'#0891B2'},itemStyle:{color:'#0891B2'}}]});
       new ResizeObserver(()=>ch.resize()).observe(document.getElementById('ins-chart'))}}
+  catch(e){toast(e.message,true)}}
+
+
+/* ---- MVP3: governed natural-language questions ---- */
+async function runAsk(){
+  const q=$('#ask-q').value.trim();if(!q)return;
+  try{const a=await withLoader(()=>api(`/datasets/${DS.id}/ask`,{method:'POST',json:{question:q}}));
+    const out=$('#ask-out');
+    if(a.explanation){
+      out.innerHTML=`<div style="margin-top:.8rem"><p style="font-size:.92rem;line-height:1.55">${esc(a.explanation.text)}</p>
+        ${a.explanation.certified_measure?`<span class="pill published">certified: ${esc(a.explanation.certified_measure)}</span>`:''}
+        <div class="readout" style="margin-top:.6rem">QUALITY <b>${a.quality_score}</b> · FRESH <b>${ago(a.freshness)}</b></div></div>`;
+      return}
+    if(!a.answered){
+      out.innerHTML=`<div style="margin-top:.8rem"><p class="muted">${esc(a.reason)}</p>
+        <p class="muted" style="font-size:.78rem">Try things like: ${a.answerable.examples.map(e=>`<code>${esc(e)}</code>`).join(' · ')}</p></div>`;
+      return}
+    let body='';
+    if(a.answer.groups){
+      const max=Math.max(...a.answer.groups.map(g=>g.value),1);
+      body=a.answer.groups.map(g=>`<div class="row" style="gap:.6rem;align-items:center;margin:.2rem 0">
+        <span style="min-width:110px;font-size:.8rem">${esc(g.group)}</span>
+        <div style="flex:1;background:var(--surface2);border-radius:6px"><div style="width:${Math.max(2,g.value/max*100)}%;background:var(--primary);height:14px;border-radius:6px"></div></div>
+        <b class="mono" style="min-width:80px;text-align:right">${fmtN(g.value)}</b></div>`).join('')}
+    else body=`<div class="kpi-value" style="color:var(--primary)">${fmtN(a.answer.value)}</div>`;
+    out.innerHTML=`<div style="margin-top:.8rem">${body}
+      <div class="readout" style="margin-top:.6rem">${esc(a.description)} · CONFIDENCE <b>${a.confidence.toUpperCase()}</b> · QUALITY <b>${a.quality_score}</b> · FRESH <b>${ago(a.freshness)}</b></div>
+      <div class="row between" style="margin-top:.5rem">
+      <button class="btn-ghost btn-sm" onclick='addAskWidget(${JSON.stringify(JSON.stringify(a.suggested_widget))})'>➕ Add as ${esc(a.suggested_widget.type)} widget to a dashboard…</button>
+      <span>${fbButtons('question',q)}</span></div>
+    </div>`}
+  catch(e){toast(e.message,true)}}
+async function addAskWidget(wjson){
+  const w=JSON.parse(wjson);
+  try{const dbs=wsFilter(await api('/dashboards')).filter(d=>!d.archived);
+    if(!dbs.length){toast('Create a dashboard first (Dashboards page)',true);return}
+    modal(`<h3>Add "${esc(w.title)}" to…</h3>
+      ${dbs.map(d=>`<div class="row between" style="padding:.4rem 0;border-bottom:1px solid var(--border)">
+        <span>${esc(d.name)}</span>
+        <button class="btn-ghost btn-sm" onclick='confirmAddAsk("${d.id}",${JSON.stringify(wjson)})'>Add</button></div>`).join('')}
+      <div class="row" style="justify-content:flex-end;margin-top:1rem"><button class="btn-ghost" onclick="closeModal()">Cancel</button></div>`)}
+  catch(e){toast(e.message,true)}}
+async function confirmAddAsk(did,wjson){
+  const w=JSON.parse(wjson);
+  try{const d=await api('/dashboards/'+did);
+    await api('/dashboards/'+did,{method:'PATCH',json:{widgets:[...d.widgets,w]}});
+    closeModal();toast(`Widget added to "${d.name}" (draft) — publish when ready`)}
+  catch(e){toast(e.message,true)}}
+
+
+/* ---- MVP3: AI-assisted prep suggestions + feedback ---- */
+async function openSuggestions(){
+  try{const r=await withLoader(()=>api(`/datasets/${DS.id}/prep-suggestions`));
+    const sugs=r.suggestions;
+    modal(`<h3>✨ Suggested fixes</h3>
+    <p class="muted" style="margin:.3rem 0 .8rem">${esc(r.note)}</p>
+    ${sugs.length?sugs.map((sg,i)=>`
+      <div style="padding:.5rem 0;border-bottom:1px solid var(--border)">
+        <div class="row between"><b>${esc(sg.op)} · ${esc(sg.column)}</b>
+          <button class="btn-ghost btn-sm" onclick="applySuggestion(${i})">Apply</button></div>
+        <p class="muted" style="margin:.2rem 0 0;font-size:.8rem">Why: ${esc(sg.reason)}<br>Effect: ${esc(sg.effect)}</p></div>`).join('')
+      +`<div class="row" style="justify-content:space-between;margin-top:1rem">
+        <span>${fbButtons('prep_suggestion','suggestions for '+DS.name)}</span>
+        <span class="row" style="gap:.5rem">
+          <button class="btn" onclick="applyAllSuggestions()">Apply all ${sugs.length}</button>
+          <button class="btn-ghost" onclick="closeModal()">Close</button></span></div>`
+      :`<div class="row" style="justify-content:flex-end;margin-top:1rem"><button class="btn" onclick="closeModal()">Close</button></div>`}`);
+    window.SUGS=sugs}
+  catch(e){toast(e.message,true)}}
+function _sugSteps(list){return list.map(s=>({op:s.op,column:s.column,...(s.value!==undefined?{value:s.value}:{})}))}
+async function applySuggestion(i){
+  try{await withLoader(()=>api(`/datasets/${DS.id}/recipe/apply`,{method:'POST',json:{steps:_sugSteps([SUGS[i]])}}));
+    toast('Applied — dataset re-scored');closeModal();openDataset(DS.id)}
+  catch(e){toast(e.message,true)}}
+async function applyAllSuggestions(){
+  try{await withLoader(()=>api(`/datasets/${DS.id}/recipe/apply`,{method:'POST',json:{steps:_sugSteps(SUGS)}}));
+    toast(`Applied ${SUGS.length} fixes — dataset re-scored`);closeModal();openDataset(DS.id)}
+  catch(e){toast(e.message,true)}}
+function fbButtons(kind,subject){
+  const s=JSON.stringify(subject).replace(/"/g,'&quot;');
+  return `<span class="muted" style="font-size:.78rem">Was this helpful?</span>
+  <button class="btn-ghost btn-sm" onclick='sendFeedback("${kind}",${s},true)'>👍</button>
+  <button class="btn-ghost btn-sm" onclick='sendFeedback("${kind}",${s},false)'>👎</button>`}
+async function sendFeedback(kind,subject,helpful){
+  try{await api('/ai/feedback',{method:'POST',json:{kind,subject,helpful}});
+    toast(helpful?'Thanks!':'Thanks — noted for the eval suite')}
   catch(e){toast(e.message,true)}}

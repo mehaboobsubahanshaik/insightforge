@@ -58,7 +58,11 @@ async function vBilling(){
               ['Connections',b.usage.connections,b.limits.max_connections],
               ['Members',b.usage.members,b.limits.max_members]];
   $('#view').innerHTML=`<div class="pagehead"><div><h2>Billing & usage</h2>
-  <p class="muted">Metered live. Limits enforced at the API — upgrades apply instantly.</p></div></div>
+  <p class="muted">Metered live. Limits enforced at the API — upgrades apply instantly.</p></div>
+  <div class="row" style="gap:.5rem">
+    <button class="btn-ghost btn-sm" onclick="startTrial()">🚀 14-day Growth trial</button>
+    <button class="btn-ghost btn-sm" onclick="openInvoices()">🧾 Invoices</button>
+    <button class="btn-ghost btn-sm" onclick="openOffboard()">Offboard…</button></div></div>
   <div class="grid two">
     <div class="card"><h3>Usage on <span style="color:var(--primary)">${esc(cur.name)}</span></h3>
       ${bars.map(([label,used,max])=>`<div style="margin-top:.8rem">
@@ -107,9 +111,10 @@ async function vSettings(){
       <label>Plan</label><input value="${esc(S.tenant.plan_code)}" disabled>
       <hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">
       <h3>Scheduled reports & alerts</h3>
-      <p class="muted" style="margin:.3rem 0 .6rem">Email digests of published dashboards, and formula-based threshold alerts on any dataset.</p>
+      <p class="muted" style="margin:.3rem 0 .6rem">Email digests of published dashboards, threshold &amp; anomaly alerts, and webhook delivery to Slack, Teams, or any endpoint.</p>
       <div class="row"><button class="btn-ghost btn-sm" onclick="openReports()">Manage reports</button>
-      <button class="btn-ghost btn-sm" onclick="openAlerts()">Manage alerts</button></div>
+      <button class="btn-ghost btn-sm" onclick="openAlerts()">Manage alerts</button>
+      <button class="btn-ghost btn-sm" onclick="openWebhooks()">Manage webhooks</button></div>
     </div>
   </div>`}
 async function enrollMfa(){
@@ -134,7 +139,7 @@ function showRecoveryCodes(codes,title){
   <div class="mono" style="columns:2;padding:.6rem;border:1px solid var(--border);border-radius:8px;font-size:.85rem;line-height:1.7">
     ${codes.map(c=>`<div>${c}</div>`).join('')}</div>
   <div class="row" style="justify-content:flex-end;margin-top:1rem;gap:.5rem">
-    <button class="btn-ghost" onclick="navigator.clipboard.writeText('${codes.join('\\n')}').then(()=>toast('Copied'))">Copy all</button>
+    <button class="btn-ghost" onclick="navigator.clipboard.writeText('${codes.join('\n')}').then(()=>toast('Copied'))">Copy all</button>
     <button class="btn" onclick="closeModal()">I saved them</button></div>`)}
 async function regenRecovery(){
   const pw=prompt('Confirm your account password to replace ALL recovery codes:');
@@ -187,11 +192,15 @@ async function openAlerts(){
   <hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">
   <label>Name</label><input id="al-name" placeholder="e.g. Revenue floor">
   <label>Governed formula</label><input id="al-formula" class="mono" placeholder="e.g. sum(total)">
-  <div class="row"><div style="flex:1"><label>Condition</label>
+  <label>Kind</label><select id="al-kind" onchange="alertKindChanged()">
+    <option value="threshold">Threshold — value crosses a line</option>
+    <option value="anomaly">Anomaly — today breaks the recent pattern</option></select>
+  <div class="row" id="al-thr-row"><div style="flex:1"><label>Condition</label>
     <select id="al-op"><option value="lt">&lt; below</option><option value="lte">≤ at or below</option>
     <option value="gt">&gt; above</option><option value="gte">≥ at or above</option></select></div>
-  <div style="flex:1"><label>Threshold</label><input id="al-thr" type="number" step="any"></div>
-  <div style="flex:1"><label>Check every</label><select id="al-int"><option value="60">Hour</option><option value="1440">Day</option><option value="15">15 min</option></select></div></div>
+  <div style="flex:1"><label>Threshold</label><input id="al-thr" type="number" step="any"></div></div>
+  <div id="al-date-row" style="display:none"><label>Date column (daily aggregation)</label><select id="al-date"></select></div>
+  <div class="row"><div style="flex:1"><label>Check every</label><select id="al-int"><option value="60">Hour</option><option value="1440">Day</option><option value="15">15 min</option></select></div></div>
   <label>Notify (comma-separated emails)</label><input id="al-to" placeholder="ops@company.com">
   <div class="row" style="justify-content:flex-end;margin-top:1rem">
     <button class="btn-ghost" onclick="closeModal()">Close</button>
@@ -209,13 +218,23 @@ async function loadAlerts(){
     <td><span class="pill ${r.last_state==='triggered'?'failing':'published'}">${r.last_state||'ok'}</span></td>
     <td><button class="btn-ghost btn-sm" onclick="toggleAlert('${id}','${r.id}',${!r.enabled})">${r.enabled?'On → pause':'Paused → resume'}</button></td></tr>`).join('')}</tbody></table>`
   :'<p class="muted">No alerts on this dataset yet.</p>'}
+function alertKindChanged(){
+  const anomaly=$('#al-kind').value==='anomaly';
+  $('#al-thr-row').style.display=anomaly?'none':'flex';
+  $('#al-date-row').style.display=anomaly?'block':'none';
+  if(anomaly){const ds=(window._alDs||[]).find(d=>d.id===$('#al-ds').value);
+    const dates=(ds?.schema||[]).filter(c=>['date','timestamp'].includes(c.inferred_type)).map(c=>c.name);
+    $('#al-date').innerHTML=dates.map(d=>`<option>${esc(d)}</option>`).join('')||'<option value="">(no date column in this dataset)</option>'}}
 async function addAlert(){
+  const anomaly=$('#al-kind').value==='anomaly';
   try{await withLoader(()=>api(`/datasets/${$('#al-ds').value}/alerts`,{method:'POST',json:{
     name:$('#al-name').value.trim()||'Alert',formula:$('#al-formula').value.trim(),
-    operator:$('#al-op').value,threshold:Number($('#al-thr').value),
+    kind:$('#al-kind').value,
+    ...(anomaly?{date_column:$('#al-date').value}:
+      {operator:$('#al-op').value,threshold:Number($('#al-thr').value)}),
     interval_minutes:Number($('#al-int').value),
     recipients:$('#al-to').value.split(',').map(s=>s.trim()).filter(Boolean)}}));
-    toast('Alert armed — evaluated on the scheduler cycle');loadAlerts()}
+    toast(anomaly?'Anomaly watch armed — checks the latest day each cycle':'Alert armed — evaluated on the scheduler cycle');loadAlerts()}
   catch(e){toast(e.message,true)}}
 async function toggleAlert(dsId,id,enabled){
   try{await api(`/datasets/${dsId}/alerts/${id}`,{method:'PATCH',json:{enabled}});loadAlerts()}
@@ -225,3 +244,95 @@ async function toggleAlert(dsId,id,enabled){
   const saved=sessionStorage.getItem('if_session');
   if(saved){try{const s=JSON.parse(saved);S.token=s.token;S.refresh=s.refresh;S.ws=s.ws||'all';enter()}catch{}}
 })();
+
+
+/* ---- MVP3 P2: webhooks (generic / Slack / Teams) ---- */
+async function openWebhooks(){
+  try{const r=await withLoader(()=>api('/webhooks'));
+    window._whEvents=r.available_events;
+    modal(`<h3>🔗 Webhooks</h3>
+    <p class="muted" style="margin:.3rem 0 .6rem">HMAC-signed event delivery. Paste a Slack/Teams incoming-webhook URL and pick the format, or point a generic endpoint at your own systems.</p>
+    <div id="wh-list">${r.webhooks.length?r.webhooks.map(h=>`
+      <div style="padding:.45rem 0;border-bottom:1px solid var(--border)">
+        <div class="row between"><b>${esc(h.name)}</b><span class="pill ${h.active?'published':'draft'}">${h.format}${h.active?'':' · paused'}</span></div>
+        <p class="muted mono" style="margin:.15rem 0;font-size:.72rem">${esc(h.url)}</p>
+        <p class="muted" style="margin:.15rem 0;font-size:.75rem">Events: ${h.events.map(esc).join(', ')||'none'} · Last: ${esc(h.last_status||'never')}</p>
+        <div class="row" style="gap:.4rem">
+          <button class="btn-ghost btn-sm" onclick="testWebhook('${h.id}')">Send test</button>
+          <button class="btn-ghost btn-sm" onclick="toggleWebhook('${h.id}',${!h.active})">${h.active?'Pause':'Resume'}</button>
+          <button class="btn-ghost btn-sm" onclick="deleteWebhook('${h.id}')">Delete</button></div></div>`).join('')
+      :'<p class="muted">No webhooks yet.</p>'}</div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">
+    <label>Name</label><input id="wh-name" placeholder="e.g. Ops Slack channel">
+    <label>URL</label><input id="wh-url" placeholder="https://hooks.slack.com/services/…">
+    <label>Format</label><select id="wh-fmt"><option value="generic">Generic JSON (signed)</option><option value="slack">Slack</option><option value="teams">Microsoft Teams</option></select>
+    <label>Events</label>
+    <div class="row" style="flex-wrap:wrap;gap:.6rem">${r.available_events.map(e=>`<label style="display:flex;gap:.3rem;align-items:center;font-weight:400"><input type="checkbox" class="wh-ev" value="${e}" checked>${e}</label>`).join('')}</div>
+    <div class="row" style="justify-content:flex-end;margin-top:1rem">
+      <button class="btn-ghost" onclick="closeModal()">Close</button>
+      <button class="btn" onclick="addWebhook()">Create webhook</button></div>`)}
+  catch(e){toast(e.message,true)}}
+async function addWebhook(){
+  try{const events=[...document.querySelectorAll('.wh-ev:checked')].map(c=>c.value);
+    const h=await withLoader(()=>api('/webhooks',{method:'POST',json:{
+      name:$('#wh-name').value.trim()||'Webhook',url:$('#wh-url').value.trim(),
+      format:$('#wh-fmt').value,events}}));
+    closeModal();
+    modal(`<h3>🔑 Webhook secret</h3>
+    <p>Store this now — it is shown <b>only once</b>. Receivers verify <span class="mono">X-InsightForge-Signature</span> = HMAC-SHA256(secret, body).</p>
+    <p class="mono" style="word-break:break-all;background:var(--surface2);padding:.6rem;border-radius:8px">${esc(h.secret)}</p>
+    <div class="row" style="justify-content:flex-end;gap:.5rem">
+      <button class="btn-ghost" onclick='navigator.clipboard.writeText("${h.secret}").then(()=>toast("Copied"))'>Copy</button>
+      <button class="btn" onclick="closeModal();openWebhooks()">Done</button></div>`)}
+  catch(e){toast(e.message,true)}}
+async function testWebhook(id){
+  try{const r=await api(`/webhooks/${id}/test`,{method:'POST'});
+    toast(`Test sent — ${r.last_status}`);openWebhooks()}
+  catch(e){toast(e.message,true)}}
+async function toggleWebhook(id,active){
+  try{await api(`/webhooks/${id}`,{method:'PATCH',json:{active}});openWebhooks()}
+  catch(e){toast(e.message,true)}}
+async function deleteWebhook(id){
+  try{await api(`/webhooks/${id}`,{method:'DELETE'});toast('Webhook deleted');openWebhooks()}
+  catch(e){toast(e.message,true)}}
+
+
+/* ---- MVP3 P3: trial, invoices, offboarding ---- */
+async function startTrial(){
+  try{const r=await withLoader(()=>api('/billing/trial',{method:'POST'}));
+    toast('Growth trial active until '+new Date(r.trial_ends_at).toLocaleDateString());vBilling()}
+  catch(e){toast(e.message,true)}}
+async function openInvoices(){
+  try{const r=await withLoader(()=>api('/billing/invoices'));
+    modal(`<h3>🧾 Invoices</h3>
+    ${r.invoices.length?r.invoices.map(i=>`
+      <div style="padding:.45rem 0;border-bottom:1px solid var(--border)">
+        <div class="row between"><b>${i.period_start} → ${i.period_end}</b><b>$${i.amount_usd.toFixed(2)}</b></div>
+        <p class="muted" style="margin:.15rem 0;font-size:.78rem">${i.line_items.map(li=>esc(li.item)+(li.count?` × ${li.count}`:'')).join(' · ')}</p></div>`).join('')
+      :'<p class="muted">No invoices yet — generate one for the current month.</p>'}
+    <div class="row" style="justify-content:flex-end;gap:.5rem;margin-top:1rem">
+      <button class="btn-ghost" onclick="genInvoice()">Generate for this month</button>
+      <button class="btn" onclick="closeModal()">Close</button></div>`)}
+  catch(e){toast(e.message,true)}}
+async function genInvoice(){
+  try{await withLoader(()=>api('/billing/invoices/generate',{method:'POST'}));
+    toast('Invoice issued');closeModal();openInvoices()}
+  catch(e){toast(e.message,true)}}
+async function openOffboard(){
+  modal(`<h3>⚠️ Offboard this organization</h3>
+  <p>Marks the organization for deletion after a <b>30-day grace period</b>. Until then everything keeps working and you can cancel. After it, data is purged permanently.</p>
+  <label>Type your organization slug to confirm</label><input id="ob-slug" placeholder="org slug">
+  <div class="row" style="justify-content:flex-end;gap:.5rem;margin-top:1rem">
+    <button class="btn-ghost" onclick="closeModal()">Keep my org</button>
+    <button class="btn" style="background:var(--danger,#c0392b)" onclick="confirmOffboard()">Begin offboarding</button></div>`)}
+async function confirmOffboard(){
+  try{const r=await withLoader(()=>api('/tenants/offboard',{method:'POST',json:{confirm_slug:$('#ob-slug').value.trim()}}));
+    closeModal();modal(`<h3>Offboarding started</h3><p>${esc(r.note)}</p>
+    <p class="muted">Deletion due: ${new Date(r.deletion_due_at).toLocaleString()}</p>
+    <div class="row" style="justify-content:flex-end;gap:.5rem">
+      <button class="btn-ghost" onclick="cancelOffboard()">Cancel offboarding</button>
+      <button class="btn" onclick="closeModal()">Close</button></div>`)}
+  catch(e){toast(e.message,true)}}
+async function cancelOffboard(){
+  try{await api('/tenants/offboard/cancel',{method:'POST'});toast('Offboarding cancelled — welcome back');closeModal()}
+  catch(e){toast(e.message,true)}}

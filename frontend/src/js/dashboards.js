@@ -80,6 +80,7 @@ async function renderDash(){
     ${canEdit?`<button class="btn-ghost" onclick="openAddWidget()">+ Widget</button>
     <button class="btn-ghost" onclick="openVersions()">Versions</button>
     <button class="btn-ghost" onclick="publishDash()">${DB.published_version?'Republish':'Publish'}</button>`:''}
+    <button class="btn-ghost" onclick="openBrief()">📜 Brief</button>
     <button class="btn-ghost" onclick="openViews()">👁 Views</button>
     <button class="btn-ghost" onclick="openComments()">💬 Comments</button>
     ${DB.published_version?`<button class="btn" onclick="openShare()">Share</button>`:''}
@@ -265,6 +266,7 @@ async function revokeShare(id){
   try{await api(`/shares/${id}/revoke`,{method:'POST'});openShare()}
   catch(e){toast(e.message,true)}}
 
+
 /* ---- Saved views: personal & shared filter sets on a dashboard ---- */
 let VLIST=[];
 async function openViews(){
@@ -309,4 +311,25 @@ async function archiveView(i){
   if(!confirm(`Remove view “${VLIST[i].name}”?`))return;
   try{await api(`/dashboards/${DB.id}/views/${VLIST[i].id}`,{method:'PATCH',
       json:{archived:true}});openViews()}
+  catch(e){toast(e.message,true)}}
+
+
+/* ---- MVP3: executive brief ---- */
+async function openBrief(){
+  try{const b=await withLoader(()=>api(`/dashboards/${DB.id}/brief`));
+    modal(`<h3>📜 Executive brief</h3>
+    <p class="muted" style="margin:.3rem 0 .8rem">Period-over-period, with drivers — every figure computed from governed data.</p>
+    ${b.headlines.length?b.headlines.map(h=>`
+      <div style="padding:.5rem 0;border-bottom:1px solid var(--border)">
+        <div class="row between"><b>${esc(h.title)}</b>
+          <span class="pill ${h.pct===null?'draft':(h.pct||'').startsWith('up')?'published':'warn'}">${h.pct===null?'all-time':esc(h.pct)}</span></div>
+        <p style="margin:.3rem 0 0;font-size:.88rem">${esc(h.sentence)}</p></div>`).join('')
+      :'<p class="muted">Add a KPI widget to this dashboard to get a brief.</p>'}
+    <p class="muted" style="margin-top:.8rem;font-size:.78rem">${b.notes.map(esc).join('<br>')}</p>
+    <div class="row between" style="margin-top:1rem;gap:.5rem">
+      <span>${fbButtons('brief',DB.name)}</span>
+      <span class="row" style="gap:.5rem">
+      <button class="btn-ghost" onclick='navigator.clipboard.writeText(BRIEF_TEXT).then(()=>toast("Copied — paste into any email or doc"))'>Copy as text</button>
+      <button class="btn" onclick="closeModal()">Close</button></span></div>`);
+    window.BRIEF_TEXT=b.text}
   catch(e){toast(e.message,true)}}

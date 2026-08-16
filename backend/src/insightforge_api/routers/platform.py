@@ -6,7 +6,7 @@ the superuser-capable app session but only ever returns statuses and counts
 import os
 
 from fastapi import APIRouter, Header, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from ..db import session_factory
 from ..models import Connection, Dashboard, Dataset, Membership, SyncRun, Tenant
@@ -73,3 +73,23 @@ async def set_tenant_status(tenant_id: str, body: dict,
                                action=f"tenant.{status}", resource_type="tenant",
                                resource_id=str(tid), detail={"by": "platform-operator"})
     return {"id": tenant_id, "status": status}
+
+
+@router.get("/status")
+async def platform_status():
+    """Public status visibility: database reachability, scheduler heartbeat,
+    API version. No auth — this is what a status page polls. (Unlike the
+    rest of this router, deliberately not secret-guarded: it exposes only
+    health booleans, never data.)"""
+    from .. import scheduler as sched
+
+    db_ok = True
+    try:
+        async with session_factory()() as s:
+            await s.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001
+        db_ok = False
+    return {"service": "insightforge-api",
+            "database": "ok" if db_ok else "down",
+            "scheduler_heartbeat": sched.last_heartbeat["at"],
+            "status": "operational" if db_ok else "degraded"}

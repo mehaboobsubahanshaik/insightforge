@@ -62,10 +62,22 @@ def create_app(with_scheduler: bool = True) -> FastAPI:
         response.headers["X-Correlation-Id"] = request.state.correlation_id
         return response
 
-    from .routers import auth, connections, dashboards, datasets, platform, tenants, workspaces
+    from .routers import (
+        ai,
+        auth,
+        connections,
+        dashboards,
+        datasets,
+        platform,
+        public_api,
+        tenants,
+        webhooks,
+        workspaces,
+    )
 
     for r in (auth.router, tenants.router, workspaces.router, datasets.router,
-              connections.router, dashboards.router, platform.router):
+              connections.router, dashboards.router, platform.router, ai.router,
+              webhooks.router, public_api.router):
         app.include_router(r)
 
     @app.get("/api/v1/health", tags=["ops"])

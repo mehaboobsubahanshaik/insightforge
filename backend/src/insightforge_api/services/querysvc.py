@@ -18,6 +18,9 @@ FILTER_OPS = {
     "lt": "(data->>:{c})::numeric < (:{v})::numeric",
     "lte": "(data->>:{c})::numeric <= (:{v})::numeric",
     "contains": "data->>:{c} ILIKE '%' || :{v} || '%'",
+    # ISO date strings order lexicographically; used by the NLQ date grammar
+    "date_gte": "data->>:{c} >= :{v}",
+    "date_lte": "data->>:{c} <= :{v}",
 }
 GROUP_LIMIT = 50
 TABLE_LIMIT = 200

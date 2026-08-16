@@ -46,7 +46,7 @@ jobs:
       - name: Dependency security scan (fails on known CVEs)
         run: |
           pip install pip-audit
-          pip-audit --local --skip-editable
+          pip-audit --strict --skip-editable
       - name: Frontend syntax (node --check every feature file)
         run: for f in frontend/src/js/*.js; do node --check "$f"; done
       - name: Migrations up (and cycle check)
@@ -57,6 +57,8 @@ jobs:
           python -m alembic upgrade head
       - name: Backend tests (66)
         run: cd backend && python -m pytest -q
+      - name: AI evaluation suite (docs/AI-EVALS.md)
+        run: cd backend && python -m pytest -m ai_eval -q
       - name: ML tests (7)
         run: cd ml && python -m pytest -q
       - name: Compose file validates

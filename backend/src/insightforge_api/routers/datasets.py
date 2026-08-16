@@ -8,7 +8,7 @@ import io
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, text
 
 from .. import audit
 from ..deps import TenantContext, get_session, require
@@ -22,7 +22,7 @@ from ..models import (
     Measure,
     Workspace,
 )
-from ..services import entitlements, ingest, querysvc
+from ..services import entitlements, ingest, narrative, nlq, prepsvc, querysvc
 from ..services.formulas import FormulaError, compile_formula
 from ..services.reportsvc import neutralize_csv_cell, safe_filename
 from .auth import _uuid_or_422
@@ -398,8 +398,10 @@ async def measure_result(dataset_id: str, measure_id: str, group_by: str | None 
 class AlertIn(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     formula: str = Field(min_length=1, max_length=500)
-    operator: str
-    threshold: float
+    kind: str = Field(default="threshold", pattern="^(threshold|anomaly)$")
+    operator: str = "gt"           # threshold rules only
+    threshold: float = 0.0         # threshold rules only
+    date_column: str | None = None  # anomaly rules only
     interval_minutes: int = Field(default=60, ge=1)
     recipients: list[str] = []
 
@@ -420,9 +422,17 @@ async def list_alerts(dataset_id: str, ctx: TenantContext = Depends(require("dat
 async def create_alert(dataset_id: str, body: AlertIn,
                        ctx: TenantContext = Depends(require("measure:create")),
                        session=Depends(get_session)):
-    if body.operator not in ("gt", "gte", "lt", "lte"):
+    if body.kind == "threshold" and body.operator not in ("gt", "gte", "lt", "lte"):
         raise HTTPException(422, "operator must be gt, gte, lt, or lte")
     ds = await _dataset_or_404(session, ctx, dataset_id)
+    if body.kind == "anomaly":
+        date_cols = [c["name"] for c in ds.schema_def
+                     if c["inferred_type"] in ("date", "timestamp")]
+        if body.date_column not in date_cols:
+            available = ", ".join(date_cols) or "none — this dataset has no date column"
+            raise HTTPException(
+                422, "Anomaly alerts need a date column to aggregate by; "
+                     f"available: {available}")
     try:
         compile_formula(body.formula, ds.schema_def)
     except FormulaError as e:
@@ -432,6 +442,7 @@ async def create_alert(dataset_id: str, body: AlertIn,
     await entitlements.enforce_min_interval(session, ctx.tenant_id, body.interval_minutes)
     rule = AlertRule(tenant_id=ctx.tenant_id, dataset_id=ds.id, name=body.name,
                      formula=body.formula, operator=body.operator, threshold=body.threshold,
+                     kind=body.kind, date_column=body.date_column,
                      interval_minutes=body.interval_minutes, recipients=body.recipients,
                      created_by=ctx.user_id)
     session.add(rule)
@@ -456,3 +467,118 @@ async def toggle_alert(dataset_id: str, alert_id: str, body: dict,
         rule.enabled = bool(body["enabled"])
     await session.commit()
     return {"id": str(rule.id), "enabled": rule.enabled}
+
+
+# ---------------------------------------------------------------------------
+# MVP3: governed natural-language questions (ADR 0013)
+# ---------------------------------------------------------------------------
+
+class AskIn(BaseModel):
+    question: str = Field(min_length=1, max_length=nlq.MAX_QUESTION_LEN)
+
+
+@router.get("/{dataset_id}/prep-suggestions")
+async def prep_suggestions(dataset_id: str,
+                           ctx: TenantContext = Depends(require("dataset:read")),
+                           session=Depends(get_session)):
+    """MVP3: AI-assisted data preparation — diagnosed from this dataset's own
+    values and quarantine; every suggestion is one click from applied."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    suggestions = await prepsvc.suggest(session, ds)
+    return {"suggestions": suggestions,
+            "note": ("Each suggestion names its evidence. Applying uses the "
+                     "same recipe engine as manual cleaning and re-scores the "
+                     "dataset.") if suggestions else
+                    "Nothing to suggest — this dataset already looks clean."}
+
+
+@router.post("/{dataset_id}/ask")
+async def ask_question(dataset_id: str, body: AskIn,
+                       ctx: TenantContext = Depends(require("dataset:read")),
+                       session=Depends(get_session)):
+    """Answer a natural-language question, grounded in this dataset's schema
+    and the tenant's certified measures. Deterministic parsing (no LLM in the
+    default path): the question can only select from allow-listed columns,
+    measures and filter ops — see services/nlq.py for the security argument."""
+    import time as _time
+
+    started = _time.perf_counter()
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    await entitlements.enforce_ai_quota(session, ctx.tenant_id)
+    measures = [{"name": m.name, "formula": m.formula, "certified": m.certified}
+                for m in (await session.execute(select(Measure).where(
+                    Measure.dataset_id == ds.id,
+                    Measure.tenant_id == ctx.tenant_id))).scalars()]
+    plan = nlq.parse_question(body.question, ds.schema_def, measures)
+    if plan.get("explain"):
+        target = plan["explain"]
+        m = next((mm for mm in measures if mm["name"] == target), None)
+        if m:
+            exp = narrative.explain_formula(m["formula"], ds.schema_def,
+                                            measures, ds.row_count or 0,
+                                            ds.quarantined_count or 0)
+            exp["text"] = f"'{target}': " + exp["text"]
+        else:
+            col = next(c for c in ds.schema_def if c["name"] == target)
+            exp = {"formula": None, "certified_measure": None,
+                   "text": (f"'{target}' is a {col['inferred_type']} column of "
+                            f"this dataset ({ds.row_count or 0:,} clean rows). "
+                            "Ask e.g. "
+                            + (f"'total {target} by month'." if col["inferred_type"]
+                               in ("number", "integer") else
+                               f"'total by {target}'."))}
+        return {"grounded": True, "answered": True, "explanation": exp,
+                "confidence": "high", "quality_score": ds.quality_score,
+                "freshness": ds.ingested_at.isoformat() if ds.ingested_at else None}
+    if not plan["ok"]:
+        return {"grounded": True, "answered": False, "reason": plan["reason"],
+                "answerable": plan["answerable"]}
+
+    # a bare "in <value>" phrase is resolved against real data, never guessed:
+    # probe allow-listed text columns for a case-insensitive exact value match.
+    if plan.get("bare_value") and not any(
+            f["op"] == "eq" for f in plan["filters"]):
+        text_cols = [c["name"] for c in ds.schema_def
+                     if c["inferred_type"] == "text"]
+        for col in text_cols:
+            probe = await session.execute(text(
+                "SELECT data->>:c AS v FROM dataset_rows "
+                "WHERE dataset_id = :did AND import_id = :imp "
+                "AND NOT is_quarantined AND lower(data->>:c) = lower(:val) "
+                "LIMIT 1"), {"c": col, "did": str(ds.id),
+                             "imp": str(ds.current_import_id),
+                             "val": plan["bare_value"]})
+            row = probe.first()
+            if row:
+                plan["filters"].append({"column": col, "op": "eq",
+                                        "value": row.v})
+                plan["description"] += f" where {col} is {row.v}"
+                plan["used"]["where"] = f"{col} = {row.v}"
+                plan["confidence"] = "high"
+                break
+
+    try:
+        result = await querysvc.execute_formula(
+            session, dataset_id=ds.id, current_import_id=ds.current_import_id,
+            dataset_schema=ds.schema_def, formula=plan["formula"],
+            group_by=plan["group_by"], filters=plan["filters"])
+    except querysvc.QueryError as e:
+        raise HTTPException(422, str(e)) from None
+    if plan.get("top_n") and "groups" in result:
+        result["groups"] = result["groups"][: plan["top_n"]]
+
+    date_cols = {c["name"] for c in ds.schema_def
+                 if c["inferred_type"] in ("date", "timestamp")}
+    widget = nlq.suggest_widget(plan, str(ds.id), body.question,
+                                plan.get("group_by") in date_cols)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="ai.question",
+                       resource_type="dataset", resource_id=str(ds.id))
+    await session.commit()  # audit persists even though this is a read
+    return {"grounded": True, "answered": True, "answer": result,
+            "elapsed_ms": round((_time.perf_counter() - started) * 1000, 1),
+            "description": plan["description"],
+            "confidence": plan["confidence"], "used": plan["used"],
+            "freshness": ds.ingested_at.isoformat() if ds.ingested_at else None,
+            "quality_score": ds.quality_score,
+            "suggested_widget": widget}

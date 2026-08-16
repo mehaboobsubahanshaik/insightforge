@@ -30,7 +30,7 @@ from ..models import (
     Workspace,
 )
 from ..security import new_opaque_token, sha256_of
-from ..services import entitlements, querysvc
+from ..services import entitlements, narrative, querysvc
 from ..services.formulas import FormulaError, compile_formula
 from ..services.reportsvc import render_dashboard_pdf, safe_filename
 from .auth import _uuid_or_422
@@ -686,3 +686,24 @@ async def export_pdf(dashboard_id: str, view: str = "published",
                        resource_id=str(d.id))
     return Response(content=pdf, media_type="application/pdf", headers={
         "Content-Disposition": f'attachment; filename="{safe_filename(d.name, "pdf")}"'})
+
+
+@router.get("/dashboards/{dashboard_id}/brief")
+async def executive_brief(dashboard_id: str,
+                          ctx: TenantContext = Depends(require("dashboard:read")),
+                          session=Depends(get_session)):
+    """MVP3: executive brief — deterministic period-over-period narrative with
+    driver attribution, composed from this dashboard's own governed widgets."""
+    d = await _dash_or_404(session, ctx, dashboard_id)
+    ds_by_id = {}
+    for w in d.widgets:
+        if w["dataset_id"] not in ds_by_id:
+            ds_by_id[w["dataset_id"]] = (await session.execute(select(Dataset).where(
+                Dataset.id == uuid.UUID(w["dataset_id"]),
+                Dataset.tenant_id == ctx.tenant_id))).scalar_one_or_none()
+    brief = await narrative.executive_brief(session, d.name, d.widgets, ds_by_id)
+    await audit.record(session, tenant_id=ctx.tenant_id, actor_user_id=ctx.user_id,
+                       action="ai.brief", resource_type="dashboard",
+                       resource_id=str(d.id))
+    await session.commit()
+    return brief

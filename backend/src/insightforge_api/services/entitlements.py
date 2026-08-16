@@ -53,3 +53,31 @@ async def record_billing_event(session: AsyncSession, tenant_id: uuid.UUID, kind
 
 async def meter(session: AsyncSession, tenant_id: uuid.UUID, name: str, value: float) -> None:
     session.add(MeterReading(tenant_id=tenant_id, meter=name, value=value))
+
+
+async def enforce_ai_quota(session: AsyncSession, tenant_id: uuid.UUID) -> None:
+    """Cost control for the AI layer: per-plan daily question allowance,
+    counted from the audit trail (every /ask records ai.question). The
+    deterministic parser is nearly free — this guardrail exists so a future
+    LLM adapter inherits a working budget mechanism, and so runaway scripted
+    callers are bounded today."""
+    from sqlalchemy import func
+    from sqlalchemy import select as _select
+
+    from ..models import AuditEvent
+
+    plan_code, limits = await get_plan(session, tenant_id)
+    limit = (limits or {}).get("ai_questions_per_day")
+    if not limit:
+        return
+    today_count = (await session.execute(
+        _select(func.count()).select_from(AuditEvent).where(
+            AuditEvent.tenant_id == tenant_id,
+            AuditEvent.action == "ai.question",
+            AuditEvent.created_at >= func.date_trunc(
+                "day", func.now())))).scalar_one()
+    if today_count >= limit:
+        raise HTTPException(
+            429, f"Daily AI question limit reached ({limit} on the "
+                 f"'{plan_code}' plan). The counter resets at midnight UTC; "
+                 "upgrading raises the allowance.")

@@ -76,6 +76,10 @@ class Tenant(Base):
     status: Mapped[str] = mapped_column(String(32), default="active")
     plan_code: Mapped[str] = mapped_column(String(32), default="free")
     features: Mapped[dict] = mapped_column(JSONB, default=dict)
+    trial_ends_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    deletion_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = _now()
 
 
@@ -219,6 +223,21 @@ class SyncRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AIFeedback(Base):
+    """Thumbs up/down on AI outputs (questions, briefs, prep suggestions) —
+    the raw material for evaluating and improving the AI layer."""
+
+    __tablename__ = "ai_feedback"
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    kind: Mapped[str] = mapped_column(String(20))
+    subject: Mapped[str] = mapped_column(Text)
+    helpful: Mapped[bool] = mapped_column(Boolean)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = _now()
+
+
 class Measure(Base):
     """Governed, reusable calculated measure — the semantic layer unit.
     Formulas are validated by services/formulas.py at write time."""
@@ -315,6 +334,24 @@ class ReportSchedule(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
 
 
+class Webhook(Base):
+    """Tenant notification endpoint: HMAC-signed event delivery (MVP3 P2)."""
+
+    __tablename__ = "webhooks"
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    name: Mapped[str] = mapped_column(String(120))
+    url: Mapped[str] = mapped_column(Text)
+    secret: Mapped[str] = mapped_column(String(64))
+    format: Mapped[str] = mapped_column(String(10), default="generic")
+    events: Mapped[list] = mapped_column(JSONB, default=list)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_status: Mapped[str] = mapped_column(String(255), default="")
+    last_delivery_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = _now()
+
+
 class AlertRule(Base):
     __tablename__ = "alert_rules"
     id: Mapped[uuid.UUID] = _pk()
@@ -329,6 +366,8 @@ class AlertRule(Base):
     recipients: Mapped[list] = mapped_column(JSONB, default=list)
     next_check_at: Mapped[datetime] = _now()
     last_state: Mapped[str] = mapped_column(String(8), default="ok")  # ok|fired
+    kind: Mapped[str] = mapped_column(String(12), default="threshold")  # threshold|anomaly
+    date_column: Mapped[str | None] = mapped_column(String(63), nullable=True)
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
 
 
@@ -353,6 +392,33 @@ class EmailOutbox(Base):
     attachment_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="queued")
     created_at: Mapped[datetime] = _now()
+
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    plan_code: Mapped[str] = mapped_column(String(32))
+    amount_usd: Mapped[float] = mapped_column()
+    line_items: Mapped[list] = mapped_column(JSONB, default=list)
+    status: Mapped[str] = mapped_column(String(12), default="issued")
+    issued_at: Mapped[datetime] = _now()
+
+
+class APIKey(Base):
+    __tablename__ = "api_keys"
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    name: Mapped[str] = mapped_column(String(120))
+    prefix: Mapped[str] = mapped_column(String(12), unique=True)
+    key_hash: Mapped[str] = mapped_column(String(64))
+    scopes: Mapped[list] = mapped_column(JSONB, default=list)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = _now()
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
 
 
 class Plan(Base):

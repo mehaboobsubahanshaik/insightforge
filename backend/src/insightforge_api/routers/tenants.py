@@ -4,7 +4,7 @@ notifications, billing & usage, plan changes, diagnostics."""
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import desc, func, select
 
 from .. import audit
@@ -17,11 +17,13 @@ from ..models import (
     Dataset,
     EmailOutbox,
     Invitation,
+    Invoice,
     Membership,
     Plan,
     SyncRun,
     Tenant,
     User,
+    uuid7,
 )
 from ..roles import TENANT_OWNER
 from ..security import new_opaque_token
@@ -243,3 +245,177 @@ async def diagnostics(ctx: TenantContext = Depends(require("usage:read")),
                                 "at": r.started_at.isoformat()} for r in failed_runs],
         "outbox": {status: count for status, count in outbox},
     }
+
+
+@router.post("/billing/trial")
+async def start_trial(ctx: TenantContext = Depends(require("tenant:manage")),
+                      session=Depends(get_session)):
+    """14-day Growth trial — once per tenant. Converting = choosing a plan
+    (POST /billing/plan) any time; unconverted trials fall back to free."""
+    tenant = (await session.execute(
+        select(Tenant).where(Tenant.id == ctx.tenant_id))).scalar_one()
+    if (tenant.features or {}).get("trial_used"):
+        raise HTTPException(409, "The trial has already been used for this "
+                                 "organization.")
+    tenant.features = {**(tenant.features or {}), "trial_used": True}
+    tenant.plan_code = "growth"
+    tenant.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=14)
+    await entitlements.record_billing_event(session, ctx.tenant_id,
+                                            "trial.started")
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="billing.trial",
+                       resource_type="tenant", resource_id=str(tenant.id))
+    await session.commit()
+    return {"plan": "growth", "trial_ends_at": tenant.trial_ends_at.isoformat(),
+            "note": "Growth features unlocked for 14 days. Pick a plan before "
+                    "it ends to keep them — otherwise the organization "
+                    "returns to free automatically (nothing is deleted)."}
+
+
+@router.get("/billing/invoices")
+async def list_invoices(ctx: TenantContext = Depends(require("tenant:manage")),
+                        session=Depends(get_session)):
+    rows = (await session.execute(select(Invoice).where(
+        Invoice.tenant_id == ctx.tenant_id).order_by(
+        Invoice.period_start.desc()))).scalars().all()
+    return {"invoices": [{
+        "id": str(i.id), "period_start": str(i.period_start),
+        "period_end": str(i.period_end), "plan": i.plan_code,
+        "amount_usd": float(i.amount_usd), "line_items": i.line_items,
+        "status": i.status, "issued_at": i.issued_at.isoformat()}
+        for i in rows]}
+
+
+@router.post("/billing/invoices/generate", status_code=201)
+async def generate_invoice(ctx: TenantContext = Depends(require("tenant:manage")),
+                           session=Depends(get_session)):
+    """Issue an invoice for the current month to date: plan base price plus
+    an informational usage summary from the metered billing events."""
+    from sqlalchemy import func
+
+    from ..models import BillingEvent
+
+    tenant = (await session.execute(
+        select(Tenant).where(Tenant.id == ctx.tenant_id))).scalar_one()
+    plan = (await session.execute(
+        select(Plan).where(Plan.code == tenant.plan_code))).scalar_one()
+    now = datetime.now(timezone.utc)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    usage = (await session.execute(
+        select(BillingEvent.kind, func.count()).where(
+            BillingEvent.tenant_id == ctx.tenant_id,
+            BillingEvent.created_at >= start).group_by(
+            BillingEvent.kind))).all()
+    items = [{"item": f"{plan.name} plan (monthly)",
+              "amount_usd": float(plan.monthly_price_usd)}]
+    items += [{"item": f"usage: {k}", "count": c, "amount_usd": 0.0}
+              for k, c in usage]
+    inv = Invoice(id=uuid7(), tenant_id=ctx.tenant_id,
+                  period_start=start.replace(tzinfo=None),
+                  period_end=now.replace(tzinfo=None),
+                  plan_code=plan.code,
+                  amount_usd=float(plan.monthly_price_usd), line_items=items)
+    session.add(inv)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="billing.invoice",
+                       resource_type="invoice", resource_id=str(inv.id))
+    await session.commit()
+    return {"id": str(inv.id), "amount_usd": float(inv.amount_usd),
+            "line_items": items}
+
+
+class OffboardIn(BaseModel):
+    confirm_slug: str
+
+
+@router.post("/tenants/offboard")
+async def offboard(body: OffboardIn,
+                   ctx: TenantContext = Depends(require("tenant:manage")),
+                   session=Depends(get_session)):
+    """Offboarding: 30-day grace, then the scheduler purges tenant data.
+    Reversible until the purge runs (POST /offboard/cancel)."""
+    tenant = (await session.execute(
+        select(Tenant).where(Tenant.id == ctx.tenant_id))).scalar_one()
+    if body.confirm_slug != tenant.slug:
+        raise HTTPException(422, f"Type the organization slug "
+                                 f"('{tenant.slug}') to confirm offboarding.")
+    tenant.status = "offboarding"
+    tenant.deletion_due_at = datetime.now(timezone.utc) + timedelta(days=30)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="tenant.offboard",
+                       resource_type="tenant", resource_id=str(tenant.id))
+    await session.commit()
+    return {"status": "offboarding",
+            "deletion_due_at": tenant.deletion_due_at.isoformat(),
+            "note": "Data will be purged after the grace period. Export "
+                    "datasets via each dataset's Export CSV until then; "
+                    "cancel any time before the purge."}
+
+
+@router.post("/tenants/offboard/cancel")
+async def cancel_offboard(ctx: TenantContext = Depends(require("tenant:manage")),
+                          session=Depends(get_session)):
+    tenant = (await session.execute(
+        select(Tenant).where(Tenant.id == ctx.tenant_id))).scalar_one()
+    tenant.status = "active"
+    tenant.deletion_due_at = None
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id,
+                       action="tenant.offboard_cancel",
+                       resource_type="tenant", resource_id=str(tenant.id))
+    await session.commit()
+    return {"status": "active", "note": "Offboarding cancelled."}
+
+
+class SupportIn(BaseModel):
+    subject: str = Field(min_length=3, max_length=200)
+    message: str = Field(min_length=3, max_length=5000)
+
+
+@router.post("/support", status_code=201)
+async def support_request(body: SupportIn,
+                          ctx: TenantContext = Depends(require("dataset:read")),
+                          session=Depends(get_session)):
+    """Support workflow entry point (docs/SUPPORT.md): recorded, audited,
+    routed to the support inbox."""
+    import os as _os
+
+    to = _os.environ.get("SUPPORT_EMAIL", "support@insightforge.dev")
+    await mailer.send(session, tenant_id=ctx.tenant_id, to_email=to,
+                      kind="support", subject=f"[support] {body.subject}",
+                      body=f"tenant={ctx.tenant_id} user={ctx.user_id}\n\n"
+                           + body.message)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="support.request",
+                       resource_type="support", resource_id=str(ctx.user_id))
+    await session.commit()
+    return {"received": True, "note": "Logged and routed to support — "
+            "acknowledgement within one business day (docs/SUPPORT.md)."}
+
+
+class PrivacyIn(BaseModel):
+    kind: str = Field(pattern="^(export|delete)$")
+    details: str | None = Field(default=None, max_length=2000)
+
+
+@router.post("/privacy-request", status_code=201)
+async def privacy_request(body: PrivacyIn,
+                          ctx: TenantContext = Depends(require("dataset:read")),
+                          session=Depends(get_session)):
+    """Individual privacy requests (export/delete my data), audited and
+    routed per docs/PRIVACY.md. Org-level deletion is self-serve via
+    offboarding."""
+    import os as _os
+
+    to = _os.environ.get("SUPPORT_EMAIL", "support@insightforge.dev")
+    await mailer.send(session, tenant_id=ctx.tenant_id, to_email=to,
+                      kind="privacy", subject=f"[privacy] {body.kind} request",
+                      body=f"tenant={ctx.tenant_id} user={ctx.user_id}\n"
+                           f"kind={body.kind}\n{body.details or ''}")
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id,
+                       action=f"privacy.{body.kind}",
+                       resource_type="privacy", resource_id=str(ctx.user_id))
+    await session.commit()
+    return {"received": True, "kind": body.kind,
+            "note": "Recorded; fulfilment per docs/PRIVACY.md (30-day SLA)."}

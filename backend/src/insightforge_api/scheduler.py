@@ -8,6 +8,7 @@ the run functions are already stateless."""
 
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, text
@@ -25,13 +26,15 @@ from .models import (
     SyncSchedule,
     User,
 )
-from .services import entitlements, mailer, querysvc, syncsvc
+from .services import entitlements, mailer, narrative, notify, querysvc, syncsvc
 from .services.reportsvc import render_dashboard_pdf
 
 log = logging.getLogger("insightforge.scheduler")
+last_heartbeat: dict = {"at": None}
 MAX_BACKOFF_MULTIPLIER = 8
 NOTIFY_AFTER_FAILURES = 3  # email the connection owner once at this streak
 REPORT_RETRY_MINUTES = 10  # one quick retry before waiting a full interval
+
 
 async def _notify_sync_failures(s, tenant_id, conn):
     """At exactly NOTIFY_AFTER_FAILURES consecutive failures, tell the owner —
@@ -51,6 +54,7 @@ async def _notify_sync_failures(s, tenant_id, conn):
               "Retries continue automatically with increasing delays. Open "
               "Sources in InsightForge to fix the connection or run a manual "
               "sync once it's resolved — a successful sync resets everything."))
+
 
 async def _due(model, when_col):
     async with session_factory()() as s:
@@ -84,6 +88,11 @@ async def run_due_schedules_once() -> int:
                     schedule.next_run_at = now + timedelta(
                         minutes=schedule.interval_minutes * backoff)
                     await _notify_sync_failures(s, tenant_id, conn)
+                    if conn.consecutive_failures == NOTIFY_AFTER_FAILURES:
+                        await notify.deliver_event(s, tenant_id, "sync.failed", {
+                            "message": f"Connection '{conn.name}' has failed "
+                                       f"{conn.consecutive_failures} times in a row.",
+                            "connection_id": str(conn.id)})
                 else:
                     conn.consecutive_failures = 0
                     conn.last_error = ""
@@ -106,6 +115,11 @@ async def run_due_schedules_once() -> int:
                 schedule.next_run_at = now + timedelta(
                     minutes=schedule.interval_minutes * backoff)
                 await _notify_sync_failures(s, tenant_id, conn)
+                if conn.consecutive_failures == NOTIFY_AFTER_FAILURES:
+                    await notify.deliver_event(s, tenant_id, "sync.failed", {
+                        "message": f"Connection '{conn.name}' has failed "
+                                   f"{conn.consecutive_failures} times in a row.",
+                        "connection_id": str(conn.id)})
                 s.add(SyncRun(tenant_id=tenant_id, connection_id=conn.id,
                               mode="incremental", trigger="scheduled", status="failed",
                               error=str(e)[:1000], finished_at=now))
@@ -138,13 +152,27 @@ async def run_due_reports_once() -> int:
                 hydrated = await _hydrate(s, tenant_id, v.widgets, [])
                 hydrated["name"] = d.name
                 pdf = render_dashboard_pdf(hydrated)
+                ds_by_id = {}
+                for w in v.widgets:
+                    if w["dataset_id"] not in ds_by_id:
+                        ds_by_id[w["dataset_id"]] = (await s.execute(
+                            select(Dataset).where(
+                                Dataset.id == uuid.UUID(w["dataset_id"])
+                            ))).scalar_one_or_none()
+                brief = await narrative.executive_brief(
+                    s, d.name, v.widgets, ds_by_id)
                 for email in report.recipients:
                     await mailer.send(
                         s, tenant_id=tenant_id, to_email=email, kind="report",
                         subject=f"Scheduled report: {d.name}",
-                        body=f"Your scheduled InsightForge report '{d.name}' is attached.\n"
-                             f"Published version v{d.published_version}.",
+                        body=(brief["text"]
+                              + f"\n\nThe full report PDF is attached "
+                                f"(published version v{d.published_version})."),
                         attachment=(f"{d.name[:40]}.pdf", pdf))
+                await notify.deliver_event(s, tenant_id, "report.sent", {
+                    "message": f"Report '{d.name}' sent to "
+                               f"{len(report.recipients)} recipient(s).",
+                    "dashboard_id": str(d.id), "dashboard": d.name})
                 await entitlements.record_billing_event(s, tenant_id, "report.sent",
                                                         len(report.recipients))
                 report.last_status = "sent"
@@ -180,6 +208,9 @@ async def run_due_alerts_once() -> int:
                 Dataset.id == rule.dataset_id))).scalar_one_or_none()
             if ds is None or ds.archived:
                 continue
+            if rule.kind == "anomaly":
+                fired += await _check_anomaly_rule(s, tenant_id, rule, ds)
+                continue
             try:
                 result = await querysvc.execute_formula(
                     s, dataset_id=ds.id, current_import_id=ds.current_import_id,
@@ -195,6 +226,9 @@ async def run_due_alerts_once() -> int:
                            f"(dataset: {ds.name})")
                 s.add(AlertEvent(tenant_id=tenant_id, rule_id=rule.id, value=value,
                                  message=message))
+                await notify.deliver_event(s, tenant_id, "alert.triggered", {
+                    "message": message, "rule_id": str(rule.id),
+                    "value": value, "dataset": ds.name})
                 for email in rule.recipients:
                     await mailer.send(s, tenant_id=tenant_id, to_email=email, kind="alert",
                                       subject=f"InsightForge alert: {rule.name}",
@@ -206,13 +240,118 @@ async def run_due_alerts_once() -> int:
     return fired
 
 
+async def _check_anomaly_rule(s, tenant_id, rule, ds) -> int:
+    """Anomaly-triggered alerts (MVP3 P2): aggregate the rule's formula per
+    day and flag when the LATEST day is a statistical anomaly (robust z via
+    insightforge_ml — same explainable detector as the Insights panel).
+    State-change-only firing, like threshold alerts."""
+    from insightforge_ml import detect_anomalies
+
+    if not rule.date_column:
+        return 0
+    try:
+        result = await querysvc.execute_formula(
+            s, dataset_id=ds.id, current_import_id=ds.current_import_id,
+            dataset_schema=ds.schema_def, formula=rule.formula,
+            group_by=rule.date_column)
+    except querysvc.QueryError:
+        return 0
+    groups = sorted((g for g in result.get("groups", [])
+                     if g.get("group") is not None),
+                    key=lambda g: str(g["group"]))
+    if len(groups) < 5:
+        return 0
+    series = [float(g["value"] or 0) for g in groups]
+    labels = [str(g["group"]) for g in groups]
+    found = detect_anomalies(series, labels=labels)
+    latest_hit = next((a for a in found.get("anomalies", [])
+                       if a.get("label") == labels[-1]), None)
+    if latest_hit and rule.last_state == "ok":
+        rule.last_state = "fired"
+        message = (f"Anomaly alert '{rule.name}': {rule.formula} on "
+                   f"{labels[-1]} was {series[-1]:,.2f} — a "
+                   f"{latest_hit.get('direction', 'shift')} vs the recent "
+                   f"pattern (dataset: {ds.name}).")
+        s.add(AlertEvent(tenant_id=tenant_id, rule_id=rule.id,
+                         value=series[-1], message=message))
+        for email in rule.recipients:
+            await mailer.send(s, tenant_id=tenant_id, to_email=email,
+                              kind="alert",
+                              subject=f"InsightForge anomaly: {rule.name}",
+                              body=message + "\nYou'll be notified again only "
+                                             "after the pattern normalizes and "
+                                             "breaks again.")
+        await notify.deliver_event(s, tenant_id, "anomaly.detected", {
+            "message": message, "rule_id": str(rule.id),
+            "value": series[-1], "date": labels[-1], "dataset": ds.name})
+        return 1
+    if not latest_hit and rule.last_state == "fired":
+        rule.last_state = "ok"
+    return 0
+
+
+async def run_lifecycle_once() -> int:
+    """P3 lifecycle jobs: expire unconverted trials to free (with an email),
+    and purge tenants whose offboarding grace period has passed."""
+    from sqlalchemy import text as _text
+
+    from .db import session_factory
+    from .models import Membership, Tenant, User
+
+    acted = 0
+    async with session_factory()() as s:
+        now = datetime.now(timezone.utc)
+        expired = (await s.execute(select(Tenant).where(
+            Tenant.trial_ends_at.is_not(None), Tenant.trial_ends_at < now,
+            Tenant.plan_code == "growth"))).scalars().all()
+        for t in expired:
+            t.plan_code = "free"
+            t.trial_ends_at = None
+            owner = (await s.execute(
+                select(User.email).join(Membership, Membership.user_id == User.id)
+                .where(Membership.tenant_id == t.id,
+                       Membership.role == "tenant_owner").limit(1))).scalar_one_or_none()
+            if owner:
+                await mailer.send(s, tenant_id=t.id, to_email=owner,
+                                  kind="billing",
+                                  subject="Your InsightForge trial ended",
+                                  body="Your 14-day Growth trial has ended and "
+                                       "the organization is back on the free "
+                                       "plan. Nothing was deleted. Choose a "
+                                       "plan in Billing to restore Growth "
+                                       "limits.")
+            acted += 1
+        due = (await s.execute(select(Tenant).where(
+            Tenant.status == "offboarding",
+            Tenant.deletion_due_at.is_not(None),
+            Tenant.deletion_due_at < now))).scalars().all()
+        for t in due:
+            async with tenant_scoped_session(t.id) as ts:
+                for table in ("dataset_rows", "dq_results", "dq_history",
+                              "alert_events", "alert_rules", "measures",
+                              "report_schedules", "dashboard_views",
+                              "dashboard_versions", "dashboards",
+                              "webhooks", "ai_feedback", "datasets"):
+                    await ts.execute(_text(
+                        f"DELETE FROM {table} "  # noqa: S608 - fixed list
+                        "WHERE tenant_id = :t"), {"t": str(t.id)})
+            t.status = "purged"
+            t.deletion_due_at = None
+            log.info("tenant %s purged after offboarding grace", t.slug)
+            acted += 1
+        await s.commit()
+    return acted
+
+
 async def scheduler_loop(poll_seconds: float = 15.0):
     log.info("scheduler started (poll every %ss)", poll_seconds)
     while True:
+        last_heartbeat["at"] = datetime.now(timezone.utc).isoformat()
         try:
             await run_due_schedules_once()
             await run_due_reports_once()
             await run_due_alerts_once()
+            await run_lifecycle_once()
         except Exception:  # noqa: BLE001 - the loop itself must survive anything
             log.exception("scheduler tick failed")
         await asyncio.sleep(poll_seconds)

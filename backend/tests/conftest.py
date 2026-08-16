@@ -29,6 +29,7 @@ ADMIN_DSN = f"postgresql://postgres:devpassword@{PG_HOST}:5432/insightforge"
 PASSWORD = "correct-horse-battery"
 TABLES = [
     "audit_events", "meter_readings", "billing_events", "email_outbox", "alert_events",
+    "ai_feedback", "webhooks",
     "alert_rules", "report_schedules", "share_links", "comments", "dashboard_views",
     "dashboard_versions", "dashboards", "measures", "sync_runs", "sync_schedules",
     "connections", "dq_history", "dq_results", "dataset_rows", "datasets", "workspaces",
