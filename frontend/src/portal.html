@@ -1,0 +1,14 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Customer Portal</title><style>body{font-family:system-ui;margin:0;background:#f6f6fb;padding:16px}
+h1{font-size:1.1rem}iframe{width:100%;height:460px;border:0;border-radius:12px;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.06);margin-bottom:16px}</style></head>
+<body><h1 id="p-title" tabindex="0">Analytics portal</h1><div id="p-list" role="main" aria-label="Dashboards"></div>
+<script>
+/* Customer portal (MVP4 E3): stack multiple embeds for one customer.
+   URL: /portal.html?tokens=t1,t2&title=Acme%20Analytics&lang=es */
+const q=new URLSearchParams(location.search);
+if(q.get('title'))document.getElementById('p-title').textContent=q.get('title');
+const lang=q.get('lang')?'&lang='+encodeURIComponent(q.get('lang')):'';
+document.getElementById('p-list').innerHTML=(q.get('tokens')||'').split(',').filter(Boolean)
+ .map((t,i)=>`<iframe src="/embed.html?token=${encodeURIComponent(t)}${lang}" title="Dashboard ${i+1}" loading="lazy"></iframe>`).join('')
+ ||'<p>No dashboards — append ?tokens=TOKEN1,TOKEN2 to the URL.</p>';
+</script></body></html>

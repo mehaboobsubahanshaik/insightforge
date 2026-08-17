@@ -80,6 +80,7 @@ async function renderDash(){
     ${canEdit?`<button class="btn-ghost" onclick="openAddWidget()">+ Widget</button>
     <button class="btn-ghost" onclick="openVersions()">Versions</button>
     <button class="btn-ghost" onclick="publishDash()">${DB.published_version?'Republish':'Publish'}</button>`:''}
+    <button class="btn-ghost" onclick="openEmbed()">🔗 Embed</button>
     <button class="btn-ghost" onclick="openBrief()">📜 Brief</button>
     <button class="btn-ghost" onclick="openViews()">👁 Views</button>
     <button class="btn-ghost" onclick="openComments()">💬 Comments</button>
@@ -332,4 +333,32 @@ async function openBrief(){
       <button class="btn-ghost" onclick='navigator.clipboard.writeText(BRIEF_TEXT).then(()=>toast("Copied — paste into any email or doc"))'>Copy as text</button>
       <button class="btn" onclick="closeModal()">Close</button></span></div>`);
     window.BRIEF_TEXT=b.text}
+  catch(e){toast(e.message,true)}}
+
+
+/* ---- MVP4 E1: embed token minting + iframe snippet ---- */
+async function openEmbed(){
+  if(!DB.published_version){toast('Publish the dashboard first — embeds serve the published snapshot',true);return}
+  modal(`<h3>🔗 Embed for a customer</h3>
+  <p class="muted" style="margin:.3rem 0 .8rem">Mints a signed token whose customer filter travels inside the signature — the viewer cannot remove or widen it.</p>
+  <label>Customer label</label><input id="em-label" placeholder="e.g. Acme Corp">
+  <div class="row"><div style="flex:1"><label>Filter column</label><input id="em-col" placeholder="e.g. customer_id"></div>
+  <div style="flex:1"><label>Equals value</label><input id="em-val" placeholder="e.g. 42"></div>
+  <div style="flex:1"><label>Expires</label><select id="em-exp"><option value="60">1 hour</option><option value="1440">24 hours</option><option value="5">5 minutes</option></select></div></div>
+  <div class="row" style="justify-content:flex-end;gap:.5rem;margin-top:1rem">
+    <button class="btn-ghost" onclick="closeModal()">Close</button>
+    <button class="btn" onclick="mintEmbed()">Mint token</button></div>
+  <div id="em-out" style="margin-top:.8rem"></div>`)}
+async function mintEmbed(){
+  try{const r=await withLoader(()=>api('/embed/tokens',{method:'POST',json:{
+    dashboard_id:DB.id,customer_label:$('#em-label').value.trim()||'Customer',
+    filters:[{column:$('#em-col').value.trim(),op:'eq',value:$('#em-val').value.trim()}],
+    expires_minutes:Number($('#em-exp').value)}}));
+    const url=`${location.origin}/embed.html?token=${encodeURIComponent(r.token)}`;
+    $('#em-out').innerHTML=`<label>Preview URL</label>
+    <p class="mono" style="word-break:break-all;font-size:.7rem;background:var(--surface2);padding:.5rem;border-radius:8px">${esc(url)}</p>
+    <label>Iframe snippet</label>
+    <p class="mono" style="word-break:break-all;font-size:.7rem;background:var(--surface2);padding:.5rem;border-radius:8px">&lt;iframe src="${esc(url)}" width="100%" height="480" frameborder="0"&gt;&lt;/iframe&gt;</p>
+    <div class="row" style="gap:.5rem"><button class="btn-ghost btn-sm" onclick='window.open("${url}","_blank")'>Open preview</button>
+    <button class="btn-ghost btn-sm" onclick='navigator.clipboard.writeText("${url}").then(()=>toast("URL copied"))'>Copy URL</button></div>`}
   catch(e){toast(e.message,true)}}

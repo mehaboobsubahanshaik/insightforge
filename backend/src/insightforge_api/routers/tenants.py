@@ -419,3 +419,59 @@ async def privacy_request(body: PrivacyIn,
     await session.commit()
     return {"received": True, "kind": body.kind,
             "note": "Recorded; fulfilment per docs/PRIVACY.md (30-day SLA)."}
+
+
+class ThemeIn(BaseModel):
+    brand_name: str | None = Field(default=None, max_length=80)
+    accent: str | None = Field(default=None, pattern="^#[0-9a-fA-F]{6}$")
+    background: str | None = Field(default=None, pattern="^#[0-9a-fA-F]{6}$")
+    foreground: str | None = Field(default=None, pattern="^#[0-9a-fA-F]{6}$")
+    locale: str | None = Field(default=None, pattern="^(en|es|fr|de|hi)$")
+    white_label: bool | None = None  # hides "Powered by InsightForge"
+
+
+@router.patch("/tenants/theme")
+async def set_theme(body: ThemeIn,
+                    ctx: TenantContext = Depends(require("tenant:manage")),
+                    session=Depends(get_session)):
+    """White-label theme (MVP4 E3): applied to every embed of this tenant."""
+    tenant = (await session.execute(
+        select(Tenant).where(Tenant.id == ctx.tenant_id))).scalar_one()
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    tenant.theme = {**(tenant.theme or {}), **updates}
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="tenant.theme",
+                       resource_type="tenant", resource_id=str(tenant.id))
+    await session.commit()
+    return {"theme": tenant.theme}
+
+
+class DomainIn(BaseModel):
+    domain: str = Field(pattern=r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?"
+                                r"(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$",
+                        max_length=255)
+
+
+@router.post("/tenants/custom-domain")
+async def set_custom_domain(body: DomainIn,
+                            ctx: TenantContext = Depends(require("tenant:manage")),
+                            session=Depends(get_session)):
+    """Custom domain (MVP4 E3): stored + uniqueness-enforced; DNS/TLS steps
+    in docs/WHITE-LABEL.md (CNAME -> platform, cert via proxy)."""
+    from sqlalchemy.exc import IntegrityError
+
+    tenant = (await session.execute(
+        select(Tenant).where(Tenant.id == ctx.tenant_id))).scalar_one()
+    tenant.custom_domain = body.domain
+    try:
+        await session.commit()
+    except IntegrityError:
+        raise HTTPException(409, "Domain already claimed by another "
+                                 "organization") from None
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="tenant.domain",
+                       resource_type="tenant", resource_id=str(tenant.id))
+    await session.commit()
+    return {"custom_domain": tenant.custom_domain,
+            "next_steps": "Point a CNAME at the platform host; embeds and "
+                          "portals will serve under it (docs/WHITE-LABEL.md)."}

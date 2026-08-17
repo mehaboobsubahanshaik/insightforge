@@ -76,6 +76,13 @@ class Tenant(Base):
     status: Mapped[str] = mapped_column(String(32), default="active")
     plan_code: Mapped[str] = mapped_column(String(32), default="free")
     features: Mapped[dict] = mapped_column(JSONB, default=dict)
+    theme: Mapped[dict] = mapped_column(JSONB, default=dict)
+    parent_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True)
+    custom_domain: Mapped[str | None] = mapped_column(
+        String(255), nullable=True)
+    embed_secret: Mapped[str | None] = mapped_column(
+        String(64), nullable=True)
     trial_ends_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
     deletion_due_at: Mapped[datetime | None] = mapped_column(
@@ -419,6 +426,15 @@ class APIKey(Base):
     created_at: Mapped[datetime] = _now()
     last_used_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
+
+
+class TenantTemplate(Base):
+    __tablename__ = "tenant_templates"
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    name: Mapped[str] = mapped_column(String(120))
+    config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = _now()
 
 
 class Plan(Base):
