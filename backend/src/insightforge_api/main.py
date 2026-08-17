@@ -69,6 +69,7 @@ def create_app(with_scheduler: bool = True) -> FastAPI:
         dashboards,
         datasets,
         embed,
+        enterprise,
         partner,
         platform,
         public_api,
@@ -79,7 +80,8 @@ def create_app(with_scheduler: bool = True) -> FastAPI:
 
     for r in (auth.router, tenants.router, workspaces.router, datasets.router,
               connections.router, dashboards.router, platform.router, ai.router,
-              webhooks.router, public_api.router, embed.router, partner.router):
+              webhooks.router, public_api.router, embed.router, partner.router,
+              enterprise.router):
         app.include_router(r)
 
     @app.get("/api/v1/health", tags=["ops"])

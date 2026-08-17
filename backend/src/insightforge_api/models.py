@@ -77,6 +77,9 @@ class Tenant(Base):
     plan_code: Mapped[str] = mapped_column(String(32), default="free")
     features: Mapped[dict] = mapped_column(JSONB, default=dict)
     theme: Mapped[dict] = mapped_column(JSONB, default=dict)
+    sso: Mapped[dict] = mapped_column(JSONB, default=dict)
+    scim_token_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True)
     parent_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True)
     custom_domain: Mapped[str | None] = mapped_column(
@@ -90,6 +93,18 @@ class Tenant(Base):
     created_at: Mapped[datetime] = _now()
 
 
+class AccessReview(Base):
+    __tablename__ = "access_reviews"
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    status: Mapped[str] = mapped_column(String(12), default="open")
+    items: Mapped[list] = mapped_column(JSONB, default=list)
+    created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = _now()
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
+
 class Membership(Base):
     __tablename__ = "memberships"
     __table_args__ = (UniqueConstraint("tenant_id", "user_id"),)
@@ -97,6 +112,7 @@ class Membership(Base):
     tenant_id: Mapped[uuid.UUID] = _tid()
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
     role: Mapped[str] = mapped_column(String(32))
+    attributes: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = _now()
 
 
@@ -136,6 +152,7 @@ class Dataset(Base):
     row_count: Mapped[int] = mapped_column(default=0)
     quarantined_count: Mapped[int] = mapped_column(default=0)
     quality_score: Mapped[int | None] = mapped_column(nullable=True)
+    access_policy: Mapped[dict] = mapped_column(JSONB, default=dict)
     profile: Mapped[dict] = mapped_column(JSONB, default=dict)
     recipe: Mapped[list] = mapped_column(JSONB, default=list)
     current_import_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
