@@ -492,6 +492,41 @@ async def prep_suggestions(dataset_id: str,
                     "Nothing to suggest — this dataset already looks clean."}
 
 
+@router.put("/{dataset_id}/governance")
+async def set_governance(dataset_id: str, body: dict,
+                         ctx: TenantContext = Depends(require("tenant:manage")),
+                         session=Depends(get_session)):
+    """G2: classification, column_policy, row_policies, retention — stored
+    per dataset, enforced on every read surface."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    allowed_keys = {"classification", "column_policy", "row_policies",
+                    "retention"}
+    bad = set(body) - allowed_keys
+    if bad:
+        raise HTTPException(422, f"Unknown governance keys {sorted(bad)}; "
+                                 f"allowed: {sorted(allowed_keys)}")
+    ret = body.get("retention")
+    if ret and (ret.get("column") not in
+                [c["name"] for c in ds.schema_def
+                 if c["inferred_type"] in ("date", "timestamp")]
+                or not isinstance(ret.get("days"), int) or ret["days"] < 1):
+        raise HTTPException(422, "retention needs a date column + days >= 1")
+    ds.governance = {**(ds.governance or {}), **body}
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="governance.set",
+                       resource_type="dataset", resource_id=str(ds.id))
+    await session.commit()
+    return {"governance": ds.governance}
+
+
+@router.get("/{dataset_id}/governance")
+async def get_governance(dataset_id: str,
+                         ctx: TenantContext = Depends(require("dataset:read")),
+                         session=Depends(get_session)):
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    return {"governance": ds.governance or {}}
+
+
 @router.post("/{dataset_id}/ask")
 async def ask_question(dataset_id: str, body: AskIn,
                        ctx: TenantContext = Depends(require("dataset:read")),
@@ -557,11 +592,28 @@ async def ask_question(dataset_id: str, body: AskIn,
                 plan["confidence"] = "high"
                 break
 
+    import re as _re
+
+    from ..models import Membership as _M
+    from ..services import datasec
+
+    mem = (await session.execute(select(_M).where(
+        _M.tenant_id == ctx.tenant_id,
+        _M.user_id == ctx.user_id))).scalar_one_or_none()
+    role = mem.role if mem else "viewer"
+    referenced = _re.findall(r"[a-z_][a-z0-9_]*", plan["formula"]) + (
+        [plan["group_by"]] if plan.get("group_by") else [])
+    known = {c["name"] for c in ds.schema_def}
+    datasec.check_columns(ds.governance or {}, role,
+                          [c for c in referenced if c in known])
+    mandatory = datasec.row_filters(ds.governance or {}, role,
+                                    (mem.attributes if mem else {}) or {})
     try:
         result = await querysvc.execute_formula(
             session, dataset_id=ds.id, current_import_id=ds.current_import_id,
             dataset_schema=ds.schema_def, formula=plan["formula"],
-            group_by=plan["group_by"], filters=plan["filters"])
+            group_by=plan["group_by"],
+            filters=(plan["filters"] or []) + mandatory)
     except querysvc.QueryError as e:
         raise HTTPException(422, str(e)) from None
     if plan.get("top_n") and "groups" in result:

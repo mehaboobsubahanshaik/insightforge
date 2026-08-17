@@ -321,6 +321,25 @@ async def run_lifecycle_once() -> int:
                                        "plan in Billing to restore Growth "
                                        "limits.")
             acted += 1
+        # advanced retention (G2): purge rows past each dataset's window
+        from .models import Dataset as _DS
+
+        rds = (await s.execute(select(_DS).where(
+            _DS.governance.isnot(None)))).scalars().all()
+        for ds in rds:
+            ret = (ds.governance or {}).get("retention")
+            if not ret:
+                continue
+            async with tenant_scoped_session(ds.tenant_id) as ts:
+                res = await ts.execute(_text(
+                    "DELETE FROM dataset_rows WHERE dataset_id = :d "
+                    "AND (data->>:c)::date < (now() - make_interval("
+                    "days => :n))::date"),
+                    {"d": str(ds.id), "c": ret["column"], "n": ret["days"]})
+                if res.rowcount:
+                    acted += 1
+                    log.info("retention purged %s rows from %s",
+                             res.rowcount, ds.name)
         due = (await s.execute(select(Tenant).where(
             Tenant.status == "offboarding",
             Tenant.deletion_due_at.is_not(None),
@@ -343,6 +362,53 @@ async def run_lifecycle_once() -> int:
     return acted
 
 
+async def run_siem_once() -> int:
+    """SIEM integration (G4): stream security-relevant audit events to
+    webhooks subscribed to 'siem.audit', with a per-tenant cursor so each
+    event ships exactly once."""
+    from .db import session_factory, tenant_scoped_session
+    from .models import AuditEvent, Tenant, Webhook
+    from .routers.enterprise import SIEM_ACTIONS
+    from .services import notify
+
+    shipped = 0
+    async with session_factory()() as s:
+        tenants = (await s.execute(select(Tenant.id))).scalars().all()
+    for tid in tenants:
+        async with tenant_scoped_session(tid) as ts:
+            hooks = (await ts.execute(select(Webhook).where(
+                Webhook.tenant_id == tid,
+                Webhook.active.is_(True)))).scalars().all()
+            if not any("siem.audit" in (h.events or []) for h in hooks):
+                continue
+            t = (await ts.execute(select(Tenant).where(
+                Tenant.id == tid))).scalar_one()
+            cursor = (t.features or {}).get("siem_cursor")
+            q = select(AuditEvent).where(
+                AuditEvent.tenant_id == tid,
+                AuditEvent.action.in_(SIEM_ACTIONS))
+            if cursor:
+                from datetime import datetime as _dt
+
+                q = q.where(AuditEvent.created_at
+                            > _dt.fromisoformat(cursor))
+            events = (await ts.execute(q.order_by(
+                AuditEvent.created_at).limit(200))).scalars().all()
+            if not events:
+                continue
+            batch = [{"at": e.created_at.isoformat(), "action": e.action,
+                      "resource": f"{e.resource_type}:{e.resource_id}"}
+                     for e in events]
+            await notify.deliver_event(ts, tid, "siem.audit", {
+                "message": f"{len(batch)} security audit event(s)",
+                "events": batch})
+            t.features = {**(t.features or {}),
+                          "siem_cursor": events[-1].created_at.isoformat()}
+            await ts.commit()
+            shipped += len(batch)
+    return shipped
+
+
 async def scheduler_loop(poll_seconds: float = 15.0):
     log.info("scheduler started (poll every %ss)", poll_seconds)
     while True:
@@ -352,6 +418,7 @@ async def scheduler_loop(poll_seconds: float = 15.0):
             await run_due_reports_once()
             await run_due_alerts_once()
             await run_lifecycle_once()
+            await run_siem_once()
         except Exception:  # noqa: BLE001 - the loop itself must survive anything
             log.exception("scheduler tick failed")
         await asyncio.sleep(poll_seconds)

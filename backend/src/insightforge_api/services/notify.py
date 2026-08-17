@@ -31,7 +31,8 @@ from .mailer import outbox_dir
 
 log = logging.getLogger("insightforge.notify")
 
-EVENTS = ("alert.triggered", "anomaly.detected", "sync.failed", "report.sent")
+EVENTS = ("alert.triggered", "anomaly.detected", "sync.failed",
+          "report.sent", "siem.audit")
 
 
 def sign(secret: str, body: bytes) -> str:

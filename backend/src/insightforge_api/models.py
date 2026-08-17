@@ -78,6 +78,7 @@ class Tenant(Base):
     features: Mapped[dict] = mapped_column(JSONB, default=dict)
     theme: Mapped[dict] = mapped_column(JSONB, default=dict)
     sso: Mapped[dict] = mapped_column(JSONB, default=dict)
+    cmk: Mapped[dict] = mapped_column(JSONB, default=dict)
     scim_token_hash: Mapped[str | None] = mapped_column(
         String(64), nullable=True)
     parent_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -153,6 +154,7 @@ class Dataset(Base):
     quarantined_count: Mapped[int] = mapped_column(default=0)
     quality_score: Mapped[int | None] = mapped_column(nullable=True)
     access_policy: Mapped[dict] = mapped_column(JSONB, default=dict)
+    governance: Mapped[dict] = mapped_column(JSONB, default=dict)
     profile: Mapped[dict] = mapped_column(JSONB, default=dict)
     recipe: Mapped[list] = mapped_column(JSONB, default=list)
     current_import_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
@@ -452,6 +454,50 @@ class TenantTemplate(Base):
     name: Mapped[str] = mapped_column(String(120))
     config: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = _now()
+
+
+class GlossaryTerm(Base):
+    __tablename__ = "glossary_terms"
+    __table_args__ = (UniqueConstraint("tenant_id", "term"),)
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    term: Mapped[str] = mapped_column(String(120))
+    definition: Mapped[str] = mapped_column(Text)
+    steward: Mapped[str] = mapped_column(String(320), default="")
+    links: Mapped[list] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = _now()
+
+
+class Approval(Base):
+    __tablename__ = "approvals"
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    kind: Mapped[str] = mapped_column(String(32))
+    subject_id: Mapped[str] = mapped_column(String(64))
+    note: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(12), default="pending")
+    requested_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    decided_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = _now()
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
+
+class MLModel(Base):
+    __tablename__ = "ml_models"
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tid()
+    name: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(16))
+    dataset_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True)
+    config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    metrics: Mapped[dict] = mapped_column(JSONB, default=dict)
+    status: Mapped[str] = mapped_column(String(12), default="active")
+    created_at: Mapped[datetime] = _now()
+    evaluated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
 
 
 class Plan(Base):

@@ -9,6 +9,7 @@ validation is documented as the production hardening step in docs/SSO.md.
 
 import base64
 import hashlib
+import json
 import re
 from datetime import datetime, timezone
 
@@ -270,3 +271,141 @@ async def decide(review_id: str, body: DecisionIn,
                        resource_type="user", resource_id=body.user_id)
     await session.commit()
     return {"status": r.status, "items": r.items}
+
+
+class CMKIn(BaseModel):
+    provider: str = Field(pattern="^(aws-kms|azure-keyvault|gcp-kms)$")
+    key_id: str = Field(min_length=8, max_length=500)
+
+
+@router.put("/cmk")
+async def configure_cmk(body: CMKIn,
+                        ctx: TenantContext = Depends(require("tenant:manage")),
+                        session=Depends(get_session)):
+    """Customer-managed key option (G2): stores the tenant's KMS key
+    reference; envelope-encryption rollout is the documented infra step
+    (docs/DATA-SECURITY.md) — data-at-rest re-encryption under this key."""
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    t.cmk = {**body.model_dump(), "status": "configured",
+             "configured_at": datetime.now(timezone.utc).isoformat()}
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="cmk.configure",
+                       resource_type="tenant", resource_id=str(t.id))
+    await session.commit()
+    return {"cmk": t.cmk}
+
+
+# ---- G4: compliance ops ----
+SLAS = {"free": {"uptime": "99.0%", "support_response": "best effort"},
+        "starter": {"uptime": "99.5%", "support_response": "1 business day"},
+        "growth": {"uptime": "99.9%", "support_response": "4 business hours",
+                   "incident_updates": "hourly"}}
+SIEM_ACTIONS = ("sso.login", "scim.provision", "scim.deprovision",
+                "access_review.revoke", "apikey.create", "apikey.revoke",
+                "webhook.create", "tenant.offboard", "governance.set",
+                "cmk.configure", "embed.token", "abac.attributes")
+
+
+@router.get("/audit/export")
+async def audit_export(format: str = "jsonl", since: str | None = None,
+                       ctx: TenantContext = Depends(require("tenant:manage")),
+                       session=Depends(get_session)):
+    """Advanced audit export: full tenant trail as JSONL or CSV for
+    archival / auditor handoff."""
+    from fastapi.responses import PlainTextResponse
+
+    from ..models import AuditEvent
+
+    q = select(AuditEvent).where(AuditEvent.tenant_id == ctx.tenant_id)
+    if since:
+        q = q.where(AuditEvent.created_at >= since)
+    rows = (await session.execute(q.order_by(
+        AuditEvent.created_at))).scalars().all()
+    recs = [{"at": r.created_at.isoformat(), "action": r.action,
+             "actor": str(r.actor_user_id) if r.actor_user_id else "system",
+             "resource_type": r.resource_type, "resource_id": r.resource_id,
+             "detail": r.detail or {}} for r in rows]
+    if format == "csv":
+        import csv as _csv
+        import io as _io
+
+        buf = _io.StringIO()
+        w = _csv.DictWriter(buf, fieldnames=list(recs[0]) if recs else
+                            ["at", "action", "actor", "resource_type",
+                             "resource_id", "detail"])
+        w.writeheader()
+        for r in recs:
+            w.writerow({**r, "detail": json.dumps(r["detail"])})
+        return PlainTextResponse(buf.getvalue(), media_type="text/csv")
+    return PlainTextResponse(
+        "\n".join(json.dumps(r) for r in recs),
+        media_type="application/x-ndjson")
+
+
+class DeploymentIn(BaseModel):
+    region: str = Field(pattern="^(eu-west|us-east|ap-south)$")
+    private_connectivity: bool = False
+    dedicated: bool = False
+
+
+@router.put("/deployment")
+async def configure_deployment(body: DeploymentIn,
+                               ctx: TenantContext = Depends(
+                                   require("tenant:manage")),
+                               session=Depends(get_session)):
+    """Regional residency + private connectivity + dedicated tenant option:
+    records the contracted posture; infra realization per
+    docs/ENTERPRISE-OPS.md (region pinning, PrivateLink/VNet, isolated
+    stack). New data lands per this config from the infra side."""
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    t.features = {**(t.features or {}),
+                  "deployment": {**body.model_dump(),
+                                 "configured_at":
+                                 datetime.now(timezone.utc).isoformat()}}
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="deployment.configure",
+                       resource_type="tenant", resource_id=str(t.id))
+    await session.commit()
+    return {"deployment": t.features["deployment"]}
+
+
+@router.get("/sla")
+async def sla(ctx: TenantContext = Depends(require("usage:read")),
+              session=Depends(get_session)):
+    """Advanced SLAs: the tenant's contracted targets + live health."""
+    from .. import scheduler as sched
+    from ..services import entitlements
+
+    code, _ = await entitlements.get_plan(session, ctx.tenant_id)
+    return {"plan": code, "sla": SLAS.get(code, SLAS["free"]),
+            "live": {"scheduler_heartbeat": sched.last_heartbeat["at"]},
+            "all_tiers": SLAS}
+
+
+class SupportAccessIn(BaseModel):
+    hours: int = Field(ge=1, le=168)
+
+
+@router.post("/support-access")
+async def grant_support_access(body: SupportAccessIn,
+                               ctx: TenantContext = Depends(
+                                   require("tenant:manage")),
+                               session=Depends(get_session)):
+    """Enterprise support control: explicitly time-boxed grant for vendor
+    support to access this tenant — nothing is accessible without it."""
+    from datetime import timedelta
+
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    until = datetime.now(timezone.utc) + timedelta(hours=body.hours)
+    t.features = {**(t.features or {}),
+                  "support_access_until": until.isoformat()}
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="support.access_grant",
+                       resource_type="tenant", resource_id=str(t.id))
+    await session.commit()
+    return {"support_access_until": until.isoformat(),
+            "note": "Auto-expires; revoke early by granting 1 hour and "
+                    "letting it lapse, or contact support."}
