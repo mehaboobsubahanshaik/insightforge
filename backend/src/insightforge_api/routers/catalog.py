@@ -154,7 +154,7 @@ async def impact_analysis(dataset_id: str,
 
 # ---- certification via approval workflow ----
 class ApprovalIn(BaseModel):
-    kind: str = Field(pattern="^(certify_dataset|action_plan|data_issue)$")
+    kind: str = Field(pattern="^(certify_dataset|action_plan|data_issue|impersonation)$")
     subject_id: str
     note: str = ""
 

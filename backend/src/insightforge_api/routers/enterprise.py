@@ -31,6 +31,9 @@ class SSOIn(BaseModel):
     entity_id: str = Field(min_length=3, max_length=500)
     sso_url: str = Field(pattern="^https://", max_length=1000)
     cert_digest: str = Field(pattern="^[0-9a-f]{64}$")  # sha256 of IdP cert DER
+    jit_provisioning: bool = False
+    jit_default_role: str = Field(default="viewer",
+                                  pattern="^(viewer|analyst|business_user)$")
 
 
 @router.put("/sso")
@@ -86,9 +89,33 @@ async def sso_acs(slug: str, request: Request):
             Membership, Membership.user_id == User.id).where(
             Membership.tenant_id == t.id,
             User.email == email))).scalar_one_or_none()
+        if user is None and (t.sso or {}).get("jit_provisioning"):
+            # R12 JIT: first SSO login provisions the member on the spot
+            import secrets as _sec
+
+            from ..security import hash_password as _hp
+
+            user = (await s.execute(select(User).where(
+                User.email == email))).scalar_one_or_none()
+            if user is None:
+                user = User(id=uuid7(), email=email,
+                            display_name=email.split("@")[0],
+                            password_hash=_hp(_sec.token_urlsafe(24)),
+                            email_verified=True)
+                s.add(user)
+                await s.flush()
+            s.add(Membership(id=uuid7(), tenant_id=t.id, user_id=user.id,
+                             role=(t.sso or {}).get("jit_default_role",
+                                                    "viewer")))
+            await s.flush()
+            await audit.record(s, tenant_id=t.id, actor_user_id=user.id,
+                               action="scim.provision",
+                               resource_type="user",
+                               resource_id=str(user.id))
         if user is None:
             raise HTTPException(403, f"No member '{email}' in this "
-                                     "organization (provision via SCIM)")
+                                     "organization (provision via SCIM, or "
+                                     "enable JIT provisioning)")
         m = (await s.execute(select(Membership).where(
             Membership.tenant_id == t.id,
             Membership.user_id == user.id))).scalar_one()
@@ -409,3 +436,75 @@ async def grant_support_access(body: SupportAccessIn,
     return {"support_access_until": until.isoformat(),
             "note": "Auto-expires; revoke early by granting 1 hour and "
                     "letting it lapse, or contact support."}
+
+
+class BreakGlassIn(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+
+
+@router.post("/break-glass")
+async def break_glass(body: BreakGlassIn,
+                      ctx: TenantContext = Depends(require("tenant:manage")),
+                      session=Depends(get_session)):
+    """R12: emergency owner access when SSO/MFA paths are down — issues a
+    1-hour token, demands a reason, screams into the audit trail and the
+    SIEM stream."""
+    from ..security import issue_access_token
+
+    m = (await session.execute(select(Membership).where(
+        Membership.tenant_id == ctx.tenant_id,
+        Membership.user_id == ctx.user_id))).scalar_one()
+    if m.role != "tenant_owner":
+        raise HTTPException(403, "Break-glass is owner-only")
+    token = issue_access_token(ctx.user_id, ctx.tenant_id, m.role)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id,
+                       action="security.break_glass",
+                       resource_type="tenant", resource_id=str(ctx.tenant_id),
+                       detail={"reason": body.reason})
+    await session.commit()
+    return {"access_token": token, "expires": "standard access-token TTL",
+            "warning": "Break-glass use is audited with your reason and "
+                       "streamed to SIEM. Rotate credentials after the "
+                       "incident."}
+
+
+@router.post("/impersonate/{user_id}")
+async def impersonate(user_id: str,
+                      ctx: TenantContext = Depends(require("tenant:manage")),
+                      session=Depends(get_session)):
+    """R12: support impersonation — requires an APPROVED 'impersonation'
+    approval for this user within 24h (reason lives in the approval note).
+    Issues a viewer-capped token AS the target; both identities audited."""
+    from datetime import timedelta
+
+    from ..models import Approval
+    from ..security import issue_access_token
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    ap = (await session.execute(select(Approval).where(
+        Approval.tenant_id == ctx.tenant_id,
+        Approval.kind == "impersonation",
+        Approval.subject_id == user_id,
+        Approval.status == "approved",
+        Approval.decided_at >= cutoff))).scalars().first()
+    if ap is None:
+        raise HTTPException(403, "Impersonation needs an APPROVED "
+                                 "'impersonation' approval (with reason) "
+                                 "for this user in the last 24h")
+    m = (await session.execute(select(Membership).where(
+        Membership.tenant_id == ctx.tenant_id,
+        Membership.user_id == user_id))).scalar_one_or_none()
+    if m is None:
+        raise HTTPException(404, "Not a member")
+    token = issue_access_token(m.user_id, ctx.tenant_id, "viewer")
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id,
+                       action="security.impersonation",
+                       resource_type="user", resource_id=user_id,
+                       detail={"approval_id": str(ap.id),
+                               "reason": ap.note})
+    await session.commit()
+    return {"access_token": token, "acting_as": user_id,
+            "capped_role": "viewer",
+            "note": "Impersonation is viewer-capped and dual-audited."}

@@ -1,6 +1,6 @@
 /* Dashboards: list, builder, widgets/charts, cross-filter, drill-through,
    versions, comments, sharing. Edit here for: new widget types, chart styling.
-   Widget schema (server-validated): {type: kpi|bar|line|area|pie|donut|table|pivot,
+   Widget schema (server-validated): {type: kpi|bar|line|area|pie|donut|table|pivot|funnel|waterfall|gauge|scatter|histogram,
    title, dataset_id, formula, group_by?, group_by2?, limit?, width?} */
 async function vDashboards(){
   const [rows,dsAll]=await Promise.all([api('/dashboards'),api('/datasets')]);
@@ -80,6 +80,8 @@ async function renderDash(){
     ${canEdit?`<button class="btn-ghost" onclick="openAddWidget()">+ Widget</button>
     <button class="btn-ghost" onclick="openVersions()">Versions</button>
     <button class="btn-ghost" onclick="publishDash()">${DB.published_version?'Republish':'Publish'}</button>`:''}
+    <button class="btn-ghost" onclick="presentMode()">🖥️ Present</button>
+    <button class="btn-ghost" onclick="printDash()">🖨️ Print</button>
     <button class="btn-ghost" onclick="openEmbed()">🔗 Embed</button>
     <button class="btn-ghost" onclick="openBrief()">📜 Brief</button>
     <button class="btn-ghost" onclick="openViews()">👁 Views</button>
@@ -131,6 +133,40 @@ function renderWidget(i,wd){
   else if(wd.type==='line'||wd.type==='area'){ch.setOption({...base,series:[{type:'line',data:vals,smooth:true,symbolSize:7,
     lineStyle:{width:3,color:'#4F46E5'},itemStyle:{color:'#7C3AED'},
     areaStyle:wd.type==='area'?{color:{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{offset:0,color:'rgba(79,70,229,.28)'},{offset:1,color:'rgba(79,70,229,0)'}]}}:undefined}]});ch.on('click',click)}
+  else if(wd.type==='funnel'){ch.setOption({tooltip:{trigger:'item'},
+    series:[{type:'funnel',left:'8%',width:'84%',top:8,bottom:8,sort:'descending',
+      label:{fontSize:10,formatter:p=>`${p.name}: ${Number(p.value).toLocaleString()}`},
+      itemStyle:{borderColor:'#fff',borderWidth:2},
+      data:(wd.groups||[]).map((r,j)=>({name:r.group,value:Math.abs(r.value||0),
+        itemStyle:{color:PALETTE[j%PALETTE.length]}}))}]});ch.on('click',p=>onChartClick(wd,p.name))}
+  else if(wd.type==='waterfall'){
+    let run=0;const helper=[],deltas=[];
+    (wd.groups||[]).forEach(r=>{const v=r.value||0;helper.push(v<0?run+v:run);deltas.push(v);run+=v});
+    ch.setOption({...base,tooltip:{trigger:'axis',formatter:ps=>{const p=ps[1]||ps[0];
+      return `${p.name}: ${Number(deltas[p.dataIndex]).toLocaleString()}`}},
+      series:[{type:'bar',stack:'wf',itemStyle:{color:'transparent'},data:helper,tooltip:{show:false}},
+        {type:'bar',stack:'wf',barMaxWidth:44,data:deltas.map((v,j)=>({value:Math.abs(v),
+          itemStyle:{color:v>=0?'#16a34a':'#dc2626',borderRadius:[6,6,0,0]}}))}]});
+    ch.on('click',p=>onChartClick(wd,p.name))}
+  else if(wd.type==='gauge'){const v=Number(wd.value||0);
+    const max=wd.max||Math.max(1,Math.ceil(v*1.25));
+    ch.setOption({series:[{type:'gauge',min:0,max,progress:{show:true,width:14},
+      axisLine:{lineStyle:{width:14}},axisTick:{show:false},splitLine:{length:8},
+      axisLabel:{fontSize:8,distance:18},pointer:{width:4},
+      detail:{fontSize:16,offsetCenter:[0,'62%'],formatter:x=>Number(x).toLocaleString()},
+      data:[{value:v}]}]})}
+  else if(wd.type==='scatter'){ch.setOption({grid:base.grid,tooltip:{trigger:'item',
+      formatter:p=>`${wd.x_column}: ${p.value[0]}<br>${wd.y_column}: ${p.value[1]}`},
+    xAxis:{type:'value',name:wd.x_column,nameTextStyle:{fontSize:9},axisLabel:{fontSize:10}},
+    yAxis:{type:'value',name:wd.y_column,nameTextStyle:{fontSize:9},axisLabel:{fontSize:10}},
+    series:[{type:'scatter',symbolSize:8,itemStyle:{color:'rgba(79,70,229,.65)'},
+      data:wd.points||[]}]})}
+  else if(wd.type==='histogram'){const bins=wd.bins||[];
+    ch.setOption({...base,xAxis:{type:'category',axisLabel:{fontSize:9,rotate:28},
+      data:bins.map(b=>`${b.from}–${b.to}`)},
+      tooltip:{trigger:'item',formatter:p=>`${p.name}<br>count: ${p.value}`},
+      series:[{type:'bar',barCategoryGap:'8%',data:bins.map(b=>({value:b.count,
+        itemStyle:{color:'#7C3AED',borderRadius:[4,4,0,0]}}))}]})}
   else{ch.setOption({tooltip:{trigger:'item'},
     series:[{type:'pie',radius:wd.type==='donut'?['42%','70%']:'70%',
       itemStyle:{borderRadius:7,borderColor:'#fff',borderWidth:2},
@@ -169,7 +205,10 @@ function openAddWidget(){
     <option value="kpi">KPI card</option><option value="bar">Bar chart</option>
     <option value="line">Line chart</option><option value="area">Area chart</option>
     <option value="pie">Pie chart</option><option value="donut">Donut chart</option>
-    <option value="table">Table (latest rows)</option><option value="pivot">Pivot (two-way)</option></select>
+    <option value="table">Table (latest rows)</option><option value="pivot">Pivot (two-way)</option>
+    <option value="funnel">Funnel</option><option value="waterfall">Waterfall</option>
+    <option value="gauge">Gauge</option><option value="scatter">Scatter plot</option>
+    <option value="histogram">Histogram</option></select>
   <label>Title</label><input id="aw-title" placeholder="e.g. Revenue by region">
   <label>Dataset</label><select id="aw-ds" onchange="awDsChanged()">${ds.map(d=>`<option value="${d.id}">${esc(d.name)}</option>`).join('')}</select>
   <div id="aw-fields"></div>
@@ -184,19 +223,27 @@ function awTypeChanged(){
   const cats=ds.schema.map(c=>c.name);
   let html='';
   if(t==='table'){html=`<label>Rows to show</label><input id="aw-limit" type="number" value="15" min="1" max="100">`}
+  else if(t==='scatter'){html=`<label>X column (numeric)</label><select id="aw-x">${nums.map(c=>`<option>${esc(c)}</option>`).join('')}</select>
+    <label>Y column (numeric)</label><select id="aw-y">${nums.map(c=>`<option ${nums[1]===c?'selected':''}>${esc(c)}</option>`).join('')}</select>`}
+  else if(t==='histogram'){html=`<label>Column (numeric)</label><select id="aw-x">${nums.map(c=>`<option>${esc(c)}</option>`).join('')}</select>
+    <label>Bins</label><input id="aw-bins" type="number" value="10" min="2" max="50">`}
   else{
     html=`<label>Governed formula <span style="text-transform:none">— e.g. sum(${esc(nums[0]||'col')}), count(), sum(x)/count()</span></label>
     <input id="aw-formula" class="mono" value="${nums.length?`sum(${esc(nums[0])})`:'count()'}">
-    ${t!=='kpi'?`<label>Group by</label><select id="aw-cat">${cats.map(c=>`<option>${esc(c)}</option>`).join('')}</select>`:''}
+    ${!['kpi','gauge'].includes(t)?`<label>Group by</label><select id="aw-cat">${cats.map(c=>`<option>${esc(c)}</option>`).join('')}</select>`:''}
+    ${t==='gauge'?`<label>Gauge max (blank = auto)</label><input id="aw-max" type="number" placeholder="e.g. 100000">`:''}
     ${t==='pivot'?`<label>Then by (columns)</label><select id="aw-cat2">${cats.map(c=>`<option>${esc(c)}</option>`).join('')}</select>`:''}`}
   $('#aw-fields').innerHTML=html}
 async function addWidget(){
   const t=$('#aw-type').value,ds=window._awDs;
   const w={type:t,title:$('#aw-title').value.trim()||'Untitled',dataset_id:ds.id};
   if(t==='table')w.limit=Number($('#aw-limit').value)||15;
+  else if(t==='scatter'){w.x_column=$('#aw-x').value;w.y_column=$('#aw-y').value}
+  else if(t==='histogram'){w.x_column=$('#aw-x').value;w.bins=Number($('#aw-bins').value)||10}
   else{w.formula=$('#aw-formula').value.trim();
     if(!w.formula){toast('Write a formula, e.g. sum(total)',true);return}
-    if(t!=='kpi')w.group_by=$('#aw-cat').value;
+    if(!['kpi','gauge'].includes(t))w.group_by=$('#aw-cat').value;
+    if(t==='gauge'&&$('#aw-max').value)w.max=Number($('#aw-max').value);
     if(t==='pivot')w.group_by2=$('#aw-cat2').value}
   if(['table','pivot'].includes(t))w.width='full';
   DB.widgets.push(w);
@@ -362,3 +409,25 @@ async function mintEmbed(){
     <div class="row" style="gap:.5rem"><button class="btn-ghost btn-sm" onclick='window.open("${url}","_blank")'>Open preview</button>
     <button class="btn-ghost btn-sm" onclick='navigator.clipboard.writeText("${url}").then(()=>toast("URL copied"))'>Copy URL</button></div>`}
   catch(e){toast(e.message,true)}}
+
+
+/* ---- R10: print stylesheet + presentation mode + snapshot ---- */
+(function(){const st=document.createElement('style');
+st.textContent=`@media print{nav,header,aside,button,.btn,.btn-ghost,.rail,
+  .topbar,.modal-backdrop{display:none!important}
+  body{background:#fff!important}.card{page-break-inside:avoid;
+  box-shadow:none!important;border:1px solid #ddd!important}}
+body.present nav,body.present header,body.present aside,body.present .rail,
+body.present .topbar,body.present button:not(.present-keep){display:none!important}
+body.present{background:#0b0b12}
+body.present .card{box-shadow:0 0 0 1px rgba(255,255,255,.06)}`;
+document.head.appendChild(st)})();
+function printDash(){window.print()}
+function presentMode(){
+  const on=document.body.classList.toggle('present');
+  if(on){document.documentElement.requestFullscreen?.().catch(()=>{});
+    toast('Presentation mode — press Esc to exit');
+    const esc=e=>{if(e.key==='Escape'){document.body.classList.remove('present');
+      document.removeEventListener('keydown',esc)}};
+    document.addEventListener('keydown',esc)}
+  else if(document.fullscreenElement)document.exitFullscreen()}

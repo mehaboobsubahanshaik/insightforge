@@ -277,6 +277,8 @@ class Measure(Base):
     formula: Mapped[str] = mapped_column(String(500))
     description: Mapped[str] = mapped_column(String(500), default="")
     certified: Mapped[bool] = mapped_column(Boolean, default=False)
+    unit: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    versions: Mapped[list] = mapped_column(JSONB, default=list)
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = _now()
 

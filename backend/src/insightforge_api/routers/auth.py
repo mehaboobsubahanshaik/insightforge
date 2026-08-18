@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from .. import audit
 from ..config import REFRESH_TOKEN_DAYS
 from ..db import bootstrap_session, session_factory, tenant_scoped_session, user_scoped_session
-from ..deps import TenantContext, get_context, get_session
+from ..deps import TenantContext, get_context, get_session, require
 from ..models import Invitation, Membership, RefreshToken, Tenant, User, Workspace
 from ..roles import ROLES, TENANT_OWNER
 from ..security import (
@@ -477,3 +477,33 @@ def _uuid_or_422(value: str, label: str) -> uuid.UUID:
 
 __all__ = ["router", "decode_access_token", "_validate_role", "_uuid_or_422"]
 
+
+@router.get("/sessions")
+async def list_sessions(ctx: TenantContext = Depends(require("dashboard:read")),
+                        session=Depends(get_session)):
+    """R12: the user's active refresh sessions."""
+    rows = (await session.execute(select(RefreshToken).where(
+        RefreshToken.user_id == ctx.user_id,
+        RefreshToken.revoked.is_(False),
+        RefreshToken.expires_at > datetime.now(timezone.utc)).order_by(
+        RefreshToken.created_at.desc()))).scalars().all()
+    return {"sessions": [{"id": str(r.id),
+                          "created_at": r.created_at.isoformat(),
+                          "expires_at": r.expires_at.isoformat()}
+                         for r in rows]}
+
+
+@router.delete("/sessions/{session_id}")
+async def revoke_session(session_id: str,
+                         ctx: TenantContext = Depends(
+                             require("dashboard:read")),
+                         session=Depends(get_session)):
+    """R12: revoke one session (stolen laptop button)."""
+    rt = (await session.execute(select(RefreshToken).where(
+        RefreshToken.id == session_id,
+        RefreshToken.user_id == ctx.user_id))).scalar_one_or_none()
+    if rt is None:
+        raise HTTPException(404, "Session not found")
+    rt.revoked = True
+    await session.commit()
+    return {"revoked": session_id}

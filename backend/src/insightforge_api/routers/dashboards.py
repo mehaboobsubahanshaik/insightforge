@@ -37,7 +37,9 @@ from .auth import _uuid_or_422
 
 router = APIRouter(prefix="/api/v1", tags=["dashboards"])
 
-WIDGET_TYPES = {"kpi", "bar", "line", "area", "pie", "donut", "table", "pivot"}
+WIDGET_TYPES = {"kpi", "bar", "line", "area", "pie", "donut", "table",
+                "pivot", "funnel", "waterfall", "gauge", "scatter",
+                "histogram"}
 MAX_WIDGETS = 24
 
 
@@ -69,6 +71,22 @@ async def _validate_widgets(session, ctx, widgets: list) -> list:
                  "width": w.get("width") if w.get("width") in ("half", "full") else "half"}
         if wtype == "table":
             clean["limit"] = min(int(w.get("limit", 25) or 25), querysvc.TABLE_LIMIT)
+        elif wtype in ("scatter", "histogram"):
+            numeric = {c["name"] for c in ds.schema_def
+                       if c["inferred_type"] in ("number", "integer")}
+            xc = w.get("x_column")
+            if xc not in numeric:
+                raise HTTPException(422, f"Widget {i + 1}: x_column must be "
+                                         "a numeric column")
+            clean["x_column"] = xc
+            if wtype == "scatter":
+                yc = w.get("y_column")
+                if yc not in numeric or yc == xc:
+                    raise HTTPException(422, f"Widget {i + 1}: y_column must "
+                                             "be a different numeric column")
+                clean["y_column"] = yc
+            else:
+                clean["bins"] = max(2, min(int(w.get("bins") or 10), 50))
         else:
             formula = str(w.get("formula", ""))
             measure_id = w.get("measure_id")
@@ -85,12 +103,20 @@ async def _validate_widgets(session, ctx, widgets: list) -> list:
             except FormulaError as e:
                 raise HTTPException(422, f"Widget {i + 1} formula error: {e}") from None
             clean["formula"] = formula
-            if wtype in ("bar", "line", "area", "pie", "donut", "pivot"):
+            if wtype in ("bar", "line", "area", "pie", "donut", "pivot",
+                         "funnel", "waterfall"):
                 gb = w.get("group_by")
                 if gb not in columns:
                     raise HTTPException(422, f"Widget {i + 1}: group_by must be a dataset "
                                              f"column")
                 clean["group_by"] = gb
+            if wtype == "gauge":
+                try:
+                    clean["max"] = float(w.get("max")) if w.get("max") \
+                        else None
+                except (TypeError, ValueError):
+                    raise HTTPException(422, f"Widget {i + 1}: max must be "
+                                             "numeric") from None
             if wtype == "pivot":
                 gb2 = w.get("group_by2")
                 if gb2 not in columns or gb2 == clean["group_by"]:
@@ -280,11 +306,46 @@ async def _hydrate(session, tenant_id, widgets: list, filters: list[dict]) -> di
                     session, dataset_id=ds.id, current_import_id=ds.current_import_id,
                     dataset_schema=ds.schema_def, formula=w["formula"],
                     group_by=w["group_by"], group_by2=w["group_by2"], filters=applicable))
-            elif w["type"] == "kpi":
+            elif w["type"] in ("kpi", "gauge"):
                 item.update(await querysvc.execute_formula(
                     session, dataset_id=ds.id, current_import_id=ds.current_import_id,
                     dataset_schema=ds.schema_def, formula=w["formula"], filters=applicable))
-            else:
+            elif w["type"] == "scatter":
+                from sqlalchemy import text as _t
+
+                rows = (await session.execute(_t(
+                    "SELECT (data->>:x)::numeric, (data->>:y)::numeric "
+                    "FROM dataset_rows WHERE dataset_id = :d "
+                    "AND import_id = :i AND NOT is_quarantined "
+                    "AND data->>:x IS NOT NULL AND data->>:y IS NOT NULL "
+                    "LIMIT 500"),
+                    {"x": w["x_column"], "y": w["y_column"],
+                     "d": str(ds.id),
+                     "i": str(ds.current_import_id)})).all()
+                item["points"] = [[float(a), float(b)] for a, b in rows]
+            elif w["type"] == "histogram":
+                from sqlalchemy import text as _t
+
+                vals = [float(v) for v in (await session.execute(_t(
+                    "SELECT (data->>:c)::numeric FROM dataset_rows "
+                    "WHERE dataset_id = :d AND import_id = :i "
+                    "AND NOT is_quarantined AND data->>:c IS NOT NULL"),
+                    {"c": w["x_column"], "d": str(ds.id),
+                     "i": str(ds.current_import_id)})).scalars().all()]
+                bins = int(w.get("bins") or 10)
+                if vals:
+                    lo, hi = min(vals), max(vals)
+                    width = (hi - lo) / bins or 1.0
+                    counts = [0] * bins
+                    for v in vals:
+                        counts[min(int((v - lo) / width), bins - 1)] += 1
+                    item["bins"] = [{"from": round(lo + b * width, 2),
+                                     "to": round(lo + (b + 1) * width, 2),
+                                     "count": c}
+                                    for b, c in enumerate(counts)]
+                else:
+                    item["bins"] = []
+            else:  # bar/line/area/pie/donut/funnel/waterfall share groups
                 item.update(await querysvc.execute_formula(
                     session, dataset_id=ds.id, current_import_id=ds.current_import_id,
                     dataset_schema=ds.schema_def, formula=w["formula"],
@@ -707,3 +768,89 @@ async def executive_brief(dashboard_id: str,
                        resource_id=str(d.id))
     await session.commit()
     return brief
+
+
+class BookmarkIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    filters: list[dict] = Field(default_factory=list, max_length=10)
+
+
+@router.post("/dashboards/{dashboard_id}/bookmarks", status_code=201)
+async def add_bookmark(dashboard_id: str, body: BookmarkIn,
+                       ctx: TenantContext = Depends(require("dashboard:read")),
+                       session=Depends(get_session)):
+    """R10: personal saved filter states per dashboard (max 20)."""
+    import copy as _copy
+
+    from ..models import Membership
+
+    await _dash_or_404(session, ctx, dashboard_id)
+    for f in body.filters:
+        if not {"column", "op", "value"} <= set(f):
+            raise HTTPException(422, "Each filter needs column/op/value")
+    m = (await session.execute(select(Membership).where(
+        Membership.tenant_id == ctx.tenant_id,
+        Membership.user_id == ctx.user_id))).scalar_one()
+    attrs = _copy.deepcopy(m.attributes or {})
+    marks = attrs.setdefault("bookmarks", {}).setdefault(dashboard_id, [])
+    marks[:] = [b for b in marks if b["name"] != body.name][:19]
+    marks.append({"name": body.name, "filters": body.filters})
+    m.attributes = attrs
+    await session.commit()
+    return {"bookmarks": marks}
+
+
+@router.get("/dashboards/{dashboard_id}/bookmarks")
+async def list_bookmarks(dashboard_id: str,
+                         ctx: TenantContext = Depends(
+                             require("dashboard:read")),
+                         session=Depends(get_session)):
+    from ..models import Membership
+
+    m = (await session.execute(select(Membership).where(
+        Membership.tenant_id == ctx.tenant_id,
+        Membership.user_id == ctx.user_id))).scalar_one()
+    return {"bookmarks": (m.attributes or {}).get(
+        "bookmarks", {}).get(dashboard_id, [])}
+
+
+@router.post("/dashboards/{dashboard_id}/snapshot", status_code=201)
+async def take_snapshot(dashboard_id: str, view: str = "published",
+                        ctx: TenantContext = Depends(
+                            require("dashboard:read")),
+                        session=Depends(get_session)):
+    """R10: point-in-time snapshot — the hydrated data (values, not just
+    widget defs) persisted as an artifact + audited. Pair with report
+    schedules for scheduled snapshots."""
+    import json as _json
+    import os as _os
+    from datetime import datetime, timezone
+
+    d = await _dash_or_404(session, ctx, dashboard_id)
+    widgets = d.widgets
+    if view == "published":
+        if d.published_version is None:
+            raise HTTPException(404, "Never published — snapshot the draft "
+                                     "with ?view=draft")
+        v = (await session.execute(select(DashboardVersion).where(
+            DashboardVersion.dashboard_id == d.id,
+            DashboardVersion.version == d.published_version))).scalar_one()
+        widgets = v.widgets
+    data = await _hydrate(session, ctx.tenant_id, widgets, [])
+    stamp = datetime.now(timezone.utc)
+    snap = {"dashboard": d.name, "view": view,
+            "taken_at": stamp.isoformat(), "taken_by": str(ctx.user_id),
+            **data}
+    outdir = _os.environ.get("OUTBOX_DIR", "/srv/outbox")
+    _os.makedirs(outdir, exist_ok=True)
+    fname = (f"snapshot-{d.id}-"
+             f"{stamp.strftime('%Y%m%dT%H%M%S')}.json")
+    with open(_os.path.join(outdir, fname), "w") as fh:
+        _json.dump(snap, fh)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="dashboard.snapshot",
+                       resource_type="dashboard", resource_id=str(d.id),
+                       detail={"file": fname, "view": view})
+    await session.commit()
+    return {"file": fname, "taken_at": snap["taken_at"],
+            "widgets": len(snap["widgets"])}

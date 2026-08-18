@@ -1042,6 +1042,56 @@ async def report_data_issue(dataset_id: str, body: IssueIn,
             "note": "Visible in the approvals queue (kind: data_issue)."}
 
 
+@router.post("/upload-xml", status_code=201)
+async def upload_xml(request: Request, file: UploadFile,
+                     workspace_id: str = Query(...),
+                     name: str = Query(..., min_length=1, max_length=255),
+                     record_tag: str = Query(..., min_length=1,
+                                             max_length=64),
+                     ctx: TenantContext = Depends(require("dataset:create")),
+                     session=Depends(get_session)):
+    """R12: XML ingestion — repeated <record_tag> elements become rows
+    (child elements + attributes -> columns), then the CSV trust pipeline."""
+    import io as _io
+    from xml.etree.ElementTree import ParseError as _XMLParseError
+
+    from defusedxml import ElementTree as ET
+    from starlette.datastructures import UploadFile as _SUF
+
+    from ..services.connectors.generic import records_to_result
+
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "Upload too large")
+    try:
+        root = ET.fromstring(raw)
+    except (_XMLParseError, ValueError) as e:
+        raise HTTPException(422, f"Not valid XML: {e}") from None
+    records = []
+    for el in root.iter(record_tag):
+        rec = dict(el.attrib)
+        for child in el:
+            rec[child.tag] = (child.text or "").strip()
+        if rec:
+            records.append(rec)
+    if not records:
+        raise HTTPException(422, f"No <{record_tag}> elements with content "
+                                 "found")
+    res = records_to_result(records, None, None)
+    import csv as _csv
+
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(res.headers)
+    w.writerows(res.rows)
+    return await upload(request=request,
+                        file=_SUF(filename=name + ".csv",
+                                  file=_io.BytesIO(
+                                      buf.getvalue().encode())),
+                        workspace_id=workspace_id, name=name,
+                        ctx=ctx, session=session)
+
+
 @router.post("/{dataset_id}/pii-scan")
 async def pii_scan(dataset_id: str,
                    ctx: TenantContext = Depends(require("tenant:manage")),

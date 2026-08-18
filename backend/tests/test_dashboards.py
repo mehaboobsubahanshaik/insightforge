@@ -21,7 +21,7 @@ async def test_widget_validation_422s(client):
     ws = await get_workspace(client, tok)
     ds = await upload_csv(client, tok, ws)
     cases = [
-        [{"type": "gauge", "title": "x", "dataset_id": ds["id"], "formula": "count()"}],
+        [{"type": "hologram", "title": "x", "dataset_id": ds["id"], "formula": "count()"}],
         [{"type": "kpi", "title": "x", "dataset_id": ds["id"], "formula": "sum(nope)"}],
         [{"type": "bar", "title": "x", "dataset_id": ds["id"], "formula": "count()",
           "group_by": "nope"}],
