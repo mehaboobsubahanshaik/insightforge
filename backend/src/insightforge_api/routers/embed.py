@@ -67,6 +67,7 @@ class TokenIn(BaseModel):
     customer_label: str = Field(min_length=1, max_length=120)
     filters: list[dict] = Field(min_length=1)  # customer awareness is mandatory
     expires_minutes: int = Field(default=60, ge=1, le=1440)
+    scope: str = Field(default="view", pattern="^(view|edit)$")
 
 
 @router.post("/tokens", status_code=201)
@@ -91,6 +92,7 @@ async def mint_token(body: TokenIn,
         tenant.embed_secret = pysecrets.token_hex(24)
     payload = {"t": str(ctx.tenant_id), "d": str(d.id),
                "c": body.customer_label, "f": body.filters,
+               "s": body.scope,
                "exp": int(time.time()) + body.expires_minutes * 60}
     token = _sign(tenant.embed_secret, payload)
     await audit.record(session, tenant_id=ctx.tenant_id,
@@ -206,3 +208,55 @@ async def embed_query(token: str, formula: str, group_by: str | None = None):
                            detail={"customer": payload["c"]})
         await s.commit()
         return {"customer": payload["c"], "results": results}
+
+
+@router.put("/{token}/widgets")
+async def embed_edit_widgets(token: str, body: dict):
+    """Embedded dashboard builder (R7, headless): an EDIT-scoped signed
+    token may update the dashboard's draft widgets — vendors build their
+    own builder UI on this + /query. View tokens are 403'd; publishing
+    stays a session-side action. The scope travels inside the signature."""
+    try:
+        tenant_id = json.loads(_unb64(token.split(".")[0]))["t"]
+    except Exception:  # noqa: BLE001
+        raise HTTPException(401, "Invalid embed token") from None
+    widgets = body.get("widgets")
+    if not isinstance(widgets, list) or len(widgets) > 30:
+        raise HTTPException(422, "Body needs widgets: list (max 30)")
+    for w in widgets:
+        if not isinstance(w, dict) or "type" not in w \
+                or "dataset_id" not in w:
+            raise HTTPException(422, "Each widget needs type + dataset_id")
+    async with tenant_scoped_session(tenant_id) as s:
+        tenant = (await s.execute(select(Tenant).where(
+            Tenant.id == tenant_id))).scalar_one_or_none()
+        if tenant is None or not tenant.embed_secret:
+            raise HTTPException(401, "Invalid embed token")
+        payload = _verify(tenant.embed_secret, token)
+        if payload.get("s") != "edit":
+            raise HTTPException(403, "This embed token is view-only — mint "
+                                     "one with scope: edit to build")
+        d = (await s.execute(select(Dashboard).where(
+            Dashboard.id == payload["d"],
+            Dashboard.tenant_id == tenant.id))).scalar_one_or_none()
+        if d is None:
+            raise HTTPException(404, "Dashboard not available")
+        from ..models import Dataset as _DS
+
+        for w in widgets:
+            ok = (await s.execute(select(_DS).where(
+                _DS.id == w["dataset_id"],
+                _DS.tenant_id == tenant.id))).scalar_one_or_none()
+            if ok is None:
+                raise HTTPException(422, "Widget references a dataset "
+                                         "outside this organization")
+        d.widgets = widgets
+        await audit.record(s, tenant_id=tenant.id, actor_user_id=None,
+                           action="embed.edit", resource_type="dashboard",
+                           resource_id=str(d.id),
+                           detail={"customer": payload["c"],
+                                   "widgets": len(widgets)})
+        await s.commit()
+        return {"draft_widgets": len(widgets),
+                "note": "Draft updated; publish from the vendor console to "
+                        "go live."}

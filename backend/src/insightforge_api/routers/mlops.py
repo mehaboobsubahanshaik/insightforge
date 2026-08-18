@@ -26,13 +26,21 @@ async def _series(session, ds, value_col: str, date_col: str) -> list[float]:
     return [float(g["value"] or 0) for g in groups]
 
 
-def _fit_metrics(series: list[float]) -> dict:
+def _fit_metrics(series: list[float],
+                 season_length: int | None = None) -> dict:
     from insightforge_ml import forecast_series
+    from insightforge_ml.forecast import holt_winters_additive
 
     if len(series) < 5:
         raise HTTPException(422, "Need at least 5 points to fit")
-    f = forecast_series(series, horizon=1)
-    return {"points": len(series),
+    if season_length:
+        try:
+            f = holt_winters_additive(series, season_length, horizon=1)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+    else:
+        f = forecast_series(series, horizon=1)
+    return {"points": len(series), "method": f["method"],
             "mae": round(f.get("residual_std", 0.0), 4),
             "level": round(f["points"][0]["forecast"], 2)}
 
@@ -42,6 +50,7 @@ class ModelIn(BaseModel):
     dataset_id: str
     value_column: str
     date_column: str
+    season_length: int | None = Field(default=None, ge=2, le=52)
 
 
 @router.post("/models", status_code=201)
@@ -56,11 +65,12 @@ async def register_model(body: ModelIn,
     if ds is None:
         raise HTTPException(404, "Dataset not found")
     series = await _series(session, ds, body.value_column, body.date_column)
-    metrics = _fit_metrics(series)
+    metrics = _fit_metrics(series, body.season_length)
     m = MLModel(id=uuid7(), tenant_id=ctx.tenant_id, name=body.name,
                 kind="forecast", dataset_id=ds.id,
                 config={"value_column": body.value_column,
-                        "date_column": body.date_column},
+                        "date_column": body.date_column,
+                        "season_length": body.season_length},
                 metrics={"baseline": metrics})
     session.add(m)
     await audit.record(session, tenant_id=ctx.tenant_id,
@@ -96,7 +106,7 @@ async def evaluate_model(model_id: str,
         Dataset.id == m.dataset_id))).scalar_one()
     series = await _series(session, ds, m.config["value_column"],
                            m.config["date_column"])
-    current = _fit_metrics(series)
+    current = _fit_metrics(series, m.config.get("season_length"))
     base_mae = m.metrics.get("baseline", {}).get("mae", 0) or 1e-9
     drift = current["mae"] > base_mae * 1.5 and current["mae"] > 1e-6
     m.metrics = {**m.metrics, "latest": current, "drift": drift}

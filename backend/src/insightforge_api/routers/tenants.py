@@ -503,3 +503,44 @@ async def set_semantics(body: SemanticsIn,
                        resource_type="tenant", resource_id=str(t.id))
     await session.commit()
     return {"semantics": t.features["semantics"]}
+
+
+@router.get("/me/favorites")
+async def my_favorites(ctx: TenantContext = Depends(require("dashboard:read")),
+                       session=Depends(get_session)):
+    m = (await session.execute(select(Membership).where(
+        Membership.tenant_id == ctx.tenant_id,
+        Membership.user_id == ctx.user_id))).scalar_one()
+    return {"favorites": (m.attributes or {}).get("favorites", [])}
+
+
+@router.post("/me/favorites/{dashboard_id}")
+async def toggle_favorite(dashboard_id: str,
+                          ctx: TenantContext = Depends(
+                              require("dashboard:read")),
+                          session=Depends(get_session)):
+    """R7 collaboration: personal dashboard favorites (toggle)."""
+    import copy as _copy
+
+    from ..models import Dashboard
+
+    d = (await session.execute(select(Dashboard).where(
+        Dashboard.id == dashboard_id,
+        Dashboard.tenant_id == ctx.tenant_id))).scalar_one_or_none()
+    if d is None:
+        raise HTTPException(404, "Dashboard not found")
+    m = (await session.execute(select(Membership).where(
+        Membership.tenant_id == ctx.tenant_id,
+        Membership.user_id == ctx.user_id))).scalar_one()
+    attrs = _copy.deepcopy(m.attributes or {})
+    favs = attrs.get("favorites", [])
+    if dashboard_id in favs:
+        favs.remove(dashboard_id)
+        state = False
+    else:
+        favs.append(dashboard_id)
+        state = True
+    attrs["favorites"] = favs
+    m.attributes = attrs
+    await session.commit()
+    return {"dashboard_id": dashboard_id, "favorite": state}

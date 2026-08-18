@@ -243,6 +243,57 @@ async def run_escalations_once() -> int:
     return sent
 
 
+async def run_dataset_health_once() -> int:
+    """R7: data-freshness + data-quality alerts, configured per dataset in
+    governance.alerts = {"freshness_hours": 24, "min_quality": 90}.
+    Fires at most once per UTC day per dataset via a stamp in governance."""
+    import copy as _copy
+    from datetime import datetime, timezone
+
+    from .db import session_factory, tenant_scoped_session
+    from .models import Dataset
+    from .services import notify
+
+    fired = 0
+    today = datetime.now(timezone.utc).date().isoformat()
+    async with session_factory()() as s:
+        ds_ids = (await s.execute(select(Dataset.id, Dataset.tenant_id).where(
+            Dataset.archived.is_(False)))).all()
+    for ds_id, tid in ds_ids:
+        async with tenant_scoped_session(tid) as ts:
+            ds = (await ts.execute(select(Dataset).where(
+                Dataset.id == ds_id))).scalar_one_or_none()
+            if ds is None:
+                continue
+            cfg = (ds.governance or {}).get("alerts") or {}
+            if not cfg or cfg.get("_last_fired") == today:
+                continue
+            msgs = []
+            fh = cfg.get("freshness_hours")
+            if fh and ds.ingested_at:
+                age_h = (datetime.now(timezone.utc)
+                         - ds.ingested_at).total_seconds() / 3600
+                if age_h > fh:
+                    msgs.append(f"'{ds.name}' data is {age_h:.0f}h old "
+                                f"(freshness SLA {fh}h).")
+            mq = cfg.get("min_quality")
+            if mq and (ds.quality_score or 100) < mq:
+                msgs.append(f"'{ds.name}' quality score "
+                            f"{ds.quality_score}/100 is below the "
+                            f"{mq} floor.")
+            if not msgs:
+                continue
+            await notify.deliver_event(ts, tid, "alert.triggered", {
+                "message": " ".join(msgs), "dataset_id": str(ds.id),
+                "kind": "dataset_health"})
+            gov = _copy.deepcopy(ds.governance or {})
+            gov.setdefault("alerts", {})["_last_fired"] = today
+            ds.governance = gov
+            await ts.commit()
+            fired += 1
+    return fired
+
+
 async def run_due_alerts_once() -> int:
     fired = 0
     for rule_id, tenant_id in await _due(AlertRule, AlertRule.next_check_at):
@@ -263,6 +314,7 @@ async def run_due_alerts_once() -> int:
                 continue
             now = datetime.now(timezone.utc)
             rule.next_check_at = now + timedelta(minutes=rule.interval_minutes)
+            lc = rule.lifecycle or {}
             ds = (await s.execute(select(Dataset).where(
                 Dataset.id == rule.dataset_id))).scalar_one_or_none()
             if ds is None or ds.archived:
@@ -277,7 +329,19 @@ async def run_due_alerts_once() -> int:
             except querysvc.QueryError:
                 continue
             value = result.get("value")
-            breached = value is not None and _OPS[rule.operator](value, rule.threshold)
+            if lc.get("relative_pct") and lc.get("date_column"):
+                # R7 relative-change alert: PoP % move vs prior equal window
+                from .services import narrative as _nar
+
+                pop = await _nar.pop_kpi(s, ds, rule.formula,
+                                         lc["date_column"], None)
+                prev = pop.get("previous") or 0
+                chg = (abs(pop["change"]) / abs(prev) * 100) if prev else 0
+                value = round(chg, 2)
+                breached = chg >= float(lc["relative_pct"])
+            else:
+                breached = value is not None and _OPS[rule.operator](
+                    value, rule.threshold)
             if breached and rule.last_state == "ok":  # state-change-only firing
                 rule.last_state = "fired"
                 message = (f"Alert '{rule.name}': {rule.formula} = {value:,.2f} is "
@@ -525,6 +589,7 @@ async def scheduler_loop(poll_seconds: float = 15.0):
             await run_siem_once()
             await run_proactive_forecasts_once()
             await run_escalations_once()
+            await run_dataset_health_once()
         except Exception:  # noqa: BLE001 - the loop itself must survive anything
             log.exception("scheduler tick failed")
         await asyncio.sleep(poll_seconds)

@@ -11,7 +11,7 @@ from insightforge_api.scheduler import _in_quiet_hours, run_escalations_once
 
 
 def test_role_catalog_scopes():
-    assert len(ROLES) == 9
+    assert len(ROLES) == 14  # full catalog (R8)
     assert role_allows("security_auditor", "audit:read")
     assert not role_allows("security_auditor", "dataset:create")
     assert role_allows("billing_admin", "usage:read")

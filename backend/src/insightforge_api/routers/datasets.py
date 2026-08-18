@@ -669,6 +669,32 @@ async def join_datasets(request: Request, body: JoinIn,
     return ds
 
 
+class UnionIn(BaseModel):
+    left_id: str
+    right_id: str
+    name: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/union", status_code=201)
+async def union_datasets(request: Request, body: UnionIn,
+                         ctx: TenantContext = Depends(require("dataset:create")),
+                         session=Depends(get_session)):
+    """R7: stack two datasets -> new dataset via the trust pipeline.
+    Columns are the ordered union; missing values are empty (typing and
+    quality judge the result honestly)."""
+    left = await _dataset_or_404(session, ctx, body.left_id)
+    right = await _dataset_or_404(session, ctx, body.right_id)
+    headers = [c["name"] for c in left.schema_def]
+    headers += [c["name"] for c in right.schema_def
+                if c["name"] not in headers]
+    rows = (await _rows_of(session, left)) + (await _rows_of(session, right))
+    if len(rows) > 500_000:
+        raise HTTPException(422, "Union too large (cap 500k rows)")
+    return await _materialize(request, session, ctx,
+                              str(left.workspace_id), body.name,
+                              headers, rows)
+
+
 class PivotIn(BaseModel):
     index: str
     columns: str
@@ -701,6 +727,86 @@ async def pivot_dataset(request: Request, dataset_id: str, body: PivotIn,
     headers = [body.index] + col_vals
     out = [{body.index: k, **{c: round(v, 4) for c, v in cells.items()}}
            for k, cells in sorted(table.items())]
+    return await _materialize(request, session, ctx, str(ds.workspace_id),
+                              body.name, headers, out)
+
+
+class UnpivotIn(BaseModel):
+    id_column: str
+    value_columns: list[str] = Field(min_length=2, max_length=30)
+    name: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/{dataset_id}/unpivot", status_code=201)
+async def unpivot_dataset(request: Request, dataset_id: str, body: UnpivotIn,
+                          ctx: TenantContext = Depends(
+                              require("dataset:create")),
+                          session=Depends(get_session)):
+    """R8: wide -> long. Each value column becomes (metric, value) rows."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    names = {c["name"] for c in ds.schema_def}
+    if {body.id_column, *body.value_columns} - names:
+        raise HTTPException(422, "All columns must exist on the dataset")
+    rows = await _rows_of(session, ds)
+    out = [{body.id_column: r.get(body.id_column), "metric": vc,
+            "value": r.get(vc)} for r in rows for vc in body.value_columns]
+    return await _materialize(request, session, ctx, str(ds.workspace_id),
+                              body.name, [body.id_column, "metric", "value"],
+                              out)
+
+
+class SplitIn(BaseModel):
+    column: str
+    delimiter: str = Field(min_length=1, max_length=5)
+    into: list[str] = Field(min_length=2, max_length=6)
+    name: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/{dataset_id}/split-column", status_code=201)
+async def split_column(request: Request, dataset_id: str, body: SplitIn,
+                       ctx: TenantContext = Depends(require("dataset:create")),
+                       session=Depends(get_session)):
+    """R8: split one column into parts by delimiter -> new dataset."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    if body.column not in {c["name"] for c in ds.schema_def}:
+        raise HTTPException(422, f"'{body.column}' not on dataset")
+    rows = await _rows_of(session, ds)
+    headers = [c["name"] for c in ds.schema_def] + body.into
+    out = []
+    for r in rows:
+        d = dict(r)
+        parts = str(r.get(body.column) or "").split(body.delimiter)
+        for i, col in enumerate(body.into):
+            d[col] = parts[i].strip() if i < len(parts) else ""
+        out.append(d)
+    return await _materialize(request, session, ctx, str(ds.workspace_id),
+                              body.name, headers, out)
+
+
+class MergeIn(BaseModel):
+    columns: list[str] = Field(min_length=2, max_length=6)
+    delimiter: str = Field(default=" ", max_length=5)
+    into: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/{dataset_id}/merge-columns", status_code=201)
+async def merge_columns(request: Request, dataset_id: str, body: MergeIn,
+                        ctx: TenantContext = Depends(require("dataset:create")),
+                        session=Depends(get_session)):
+    """R8: concatenate columns into one -> new dataset."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    names = {c["name"] for c in ds.schema_def}
+    if set(body.columns) - names:
+        raise HTTPException(422, "All columns must exist on the dataset")
+    rows = await _rows_of(session, ds)
+    headers = [c["name"] for c in ds.schema_def] + [body.into]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d[body.into] = body.delimiter.join(
+            str(r.get(c) or "").strip() for c in body.columns).strip()
+        out.append(d)
     return await _materialize(request, session, ctx, str(ds.workspace_id),
                               body.name, headers, out)
 

@@ -50,6 +50,69 @@ def create_app(with_scheduler: bool = True) -> FastAPI:
     )
     register_problem_handlers(app)
 
+    import hashlib as _hl
+    import os as _os
+    import time as _time
+
+    _rate: dict = {}
+    _idem: dict = {}
+
+    @app.middleware("http")
+    async def rate_limit_and_idempotency(request, call_next):
+        """R7 API hardening. Rate limit: per bearer token (or IP),
+        RATE_LIMIT_PER_MIN (default 300), honest 429 + Retry-After.
+        Idempotency: POSTs with an Idempotency-Key replay the first
+        response for the same key+path+body (per-process cache — a shared
+        store is the multi-instance deployment step)."""
+        if request.url.path.startswith("/api/"):
+            ident = request.headers.get("Authorization",
+                                        request.client.host if request.client
+                                        else "anon")[:80]
+            limit = int(_os.environ.get("RATE_LIMIT_PER_MIN", "300"))
+            now = int(_time.time() // 60)
+            win, count = _rate.get(ident, (now, 0))
+            if win != now:
+                win, count = now, 0
+            if count >= limit:
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse({"detail": "Rate limit exceeded "
+                                     f"({limit}/min). Retry shortly."},
+                                    status_code=429,
+                                    headers={"Retry-After": "60"})
+            _rate[ident] = (win, count + 1)
+            if len(_rate) > 10000:
+                _rate.clear()
+            ikey = request.headers.get("Idempotency-Key")
+            if ikey and request.method == "POST":
+                body = await request.body()
+                sig = _hl.sha256(
+                    f"{ident}|{ikey}|{request.url.path}".encode()
+                    + body).hexdigest()
+                if sig in _idem:
+                    from fastapi.responses import Response as _Resp
+
+                    status, media, payload = _idem[sig]
+                    return _Resp(content=payload, status_code=status,
+                                 media_type=media,
+                                 headers={"Idempotency-Replayed": "true"})
+                response = await call_next(request)
+                if response.status_code < 500:
+                    chunks = [c async for c in response.body_iterator]
+                    payload = b"".join(chunks)
+                    if len(_idem) > 1000:
+                        _idem.clear()
+                    _idem[sig] = (response.status_code,
+                                  response.media_type, payload)
+                    from fastapi.responses import Response as _Resp
+
+                    return _Resp(content=payload,
+                                 status_code=response.status_code,
+                                 media_type=response.media_type,
+                                 headers=dict(response.headers))
+                return response
+        return await call_next(request)
+
     @app.middleware("http")
     async def security_headers(request, call_next):
         """R1 security headers: API is JSON-only -> deny framing/sniffing;

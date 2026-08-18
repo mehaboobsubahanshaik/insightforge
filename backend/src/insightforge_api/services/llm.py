@@ -22,6 +22,18 @@ from .pii import PATTERNS
 
 REDACTED = "[REDACTED]"
 
+INJECTION_MARKERS = ("ignore previous", "ignore all previous",
+                     "disregard your instructions", "system prompt",
+                     "you are now", "new instructions:", "assistant:",
+                     "developer mode", "reveal your prompt")
+
+
+def detect_injection(text: str) -> bool:
+    """R8: prompt-injection scan of SOURCE CONTENT — data values become
+    part of grounded text, so hostile rows could smuggle directives."""
+    low = (text or "").lower()
+    return any(m in low for m in INJECTION_MARKERS)
+
 
 def redact(text: str) -> str:
     """Strip PII token-by-token before any external egress."""
@@ -62,6 +74,14 @@ class LLMClient:
         if not self.external:
             result = {"text": grounded_text, "provider": "deterministic",
                       "model": None, "tokens_in": 0, "tokens_out": 0}
+        elif detect_injection(prompt) or detect_injection(grounded_text):
+            await audit.record(session, tenant_id=tenant_id,
+                               actor_user_id=actor_user_id,
+                               action="ai.injection_blocked",
+                               resource_type="llm", resource_id=self.provider)
+            result = {"text": grounded_text, "provider": "deterministic",
+                      "model": None, "tokens_in": 0, "tokens_out": 0,
+                      "injection_blocked": True}
         else:
             safe_prompt = redact(prompt)
             data = await self._post({
