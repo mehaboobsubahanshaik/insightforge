@@ -64,6 +64,14 @@ CATALOG = [
     {"type": "ga4", "label": "Google Analytics 4", "engine": "ga4",
      "category": "SaaS apps", "color": "#F9AB00", "glyph": "G4",
      "blurb": "Daily traffic & conversions (sandbox demo included)"},
+    {"type": "rest-api", "label": "REST API (generic)",
+     "engine": "rest-api", "category": "Business apps", "color": "#455a64",
+     "glyph": "{}", "blurb": "Any read-only JSON endpoint — bring your own "
+                             "API"},
+    {"type": "google-sheets-csv", "label": "Google Sheets",
+     "engine": "google-sheets-csv", "category": "Files & sheets",
+     "color": "#0f9d58", "glyph": "▦",
+     "blurb": "Publish-to-web CSV link, no OAuth"},
 ]
 
 BY_TYPE = {c["type"]: c for c in CATALOG}

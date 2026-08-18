@@ -51,6 +51,19 @@ def create_app(with_scheduler: bool = True) -> FastAPI:
     register_problem_handlers(app)
 
     @app.middleware("http")
+    async def security_headers(request, call_next):
+        """R1 security headers: API is JSON-only -> deny framing/sniffing;
+        embed viewer framing is the web container's concern (nginx serves it)."""
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        return response
+
+
+    @app.middleware("http")
     async def correlation_and_limits(request: Request, call_next):
         request.state.correlation_id = request.headers.get(
             "X-Correlation-Id", uuid.uuid4().hex)

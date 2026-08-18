@@ -29,7 +29,7 @@ MYSQL_CONN = {"connector_type": "mariadb", "name": "mysql shop",
 async def test_catalog_gallery_shape(client):
     tok = await register_and_login(client)
     types = (await client.get("/api/v1/connections/types", headers=auth(tok))).json()
-    assert len(types) == 19
+    assert len(types) == 21  # +rest-api +google-sheets-csv (R2)
     by_type = {t["type"]: t for t in types}
     for alias in ("supabase", "neon", "amazon-rds-postgresql", "cockroachdb"):
         assert by_type[alias]["engine"] == "postgresql"

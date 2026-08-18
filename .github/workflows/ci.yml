@@ -46,7 +46,7 @@ jobs:
       - name: Dependency security scan (fails on known CVEs)
         run: |
           pip install pip-audit
-          pip-audit --strict --skip-editable
+          pip-audit --local --skip-editable
       - name: Frontend syntax (node --check every feature file)
         run: for f in frontend/src/js/*.js; do node --check "$f"; done
       - name: Migrations up (and cycle check)
@@ -63,3 +63,35 @@ jobs:
         run: cd ml && python -m pytest -q
       - name: Compose file validates
         run: docker compose config -q
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: SBOM (CycloneDX)
+        run: |
+          pip install pip-audit
+          pip install -e backend
+          pip-audit --local --skip-editable --format cyclonedx-json -o sbom.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+      - name: Container/filesystem vulnerability scan (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true

@@ -4,6 +4,7 @@ MySQL-wire platforms share the MySQL driver (the wire protocol IS the
 integration); the six SaaS connectors are individual implementations."""
 
 from .catalog import BY_TYPE, CATALOG
+from .generic import GoogleSheetCsvConnector, RestApiConnector
 from .mysql import MySQLConnector
 from .postgres import PostgresConnector
 from .saas import (
@@ -26,6 +27,8 @@ _ENGINES = {
     "shopify": ShopifyConnector(),
     "stripe": StripeConnector(),
     "ga4": GA4Connector(),
+    "rest-api": RestApiConnector(),
+    "google-sheets-csv": GoogleSheetCsvConnector(),
 }
 
 REGISTRY = {c["type"]: _ENGINES[c["engine"]] for c in CATALOG}
@@ -47,6 +50,10 @@ def _keys_for(entry) -> set:
         return set(_PG_KEYS)
     if entry["engine"] == "mysql":
         return set(_MY_KEYS)
+    if entry["engine"] == "rest-api":
+        return {"url", "records_path", "cursor_field", "header_name"}
+    if entry["engine"] == "google-sheets-csv":
+        return {"csv_url", "cursor_field"}
     return set(_SAAS_KEYS[entry["engine"]])
 
 

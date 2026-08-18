@@ -1,23 +1,17 @@
-# Threat Model (STRIDE-lite, MVP scope)
+# Threat Model (STRIDE summary)
 
-**Assets**: tenant business data, credentials for customer databases/SaaS,
-session tokens, platform secret.
+Assets: tenant business data, credentials/keys/tokens, audit trail, AI quota.
+Trust boundaries: browser->nginx->API; API->Postgres (RLS); scheduler->
+external webhooks; embed tokens in third-party pages; SCIM/SSO from IdPs.
 
-| Threat | Control | Where |
+| Threat | Vector | Mitigation (tested) |
 |---|---|---|
-| Cross-tenant read (IDOR) | PostgreSQL **RLS on every tenant table**, session GUC `app.tenant_id`; API works as non-superuser `app_user` in prod | `database/migrations/0001…0002`, `backend/src/insightforge_api/db.py`; proven in `tests/test_billing_security.py` by connecting AS `app_user` |
-| SQL injection via connector config | identifiers regex-validated **and** quoted; values parameterised; per-type `ALLOWED_CONFIG_KEYS` | `services/connectors/{postgres,mysql}.py`, `__init__.py` |
-| SSRF to cloud metadata | `BLOCKED_HOSTS` (169.254.169.254, metadata.google.internal) | both engines |
-| Credential theft at rest | per-tenant envelope encryption (Fernet) via vault service; creds never in API responses | `services/vault.py`; asserted in tests |
-| Session theft | short-lived JWT access + rotating refresh (hash-stored, RLS-scoped) | `routers/auth.py`, 0002 identity RLS |
-| Brute force | login throttling + lockout counters; MFA (TOTP) | `services/security.py` |
-| Suspended tenant access | login 403 + middleware check | `routers/auth.py`, `test_new_features.py` |
-| Platform console abuse | secret header, counts-only responses, audit events | `routers/platform.py` |
-| Request flooding / oversized bodies | request-size guard middleware, upload caps | `main.py` |
-| Share-link scraping | random 128-bit tokens, expiry enforced server-side | `routers/dashboards.py` |
-| Stored XSS via tenant data | every render path escapes through `esc()`; no `innerHTML` of raw values; CSP-friendly single-origin app | `frontend/src/js/core.js` (esc), all view files |
-| CSRF | no cookie auth: bearer token sent via `Authorization` header only, so cross-site form posts carry no credentials; state-changing routes reject missing/invalid JWT | `routers/auth.py`, `deps.py` |
+| Spoofing | forged embed/SCIM/SSO tokens | HMAC signatures, pinned certs, hashed bearer tokens (401 tests) |
+| Tampering | filter widening in embeds; SQL injection | filters inside signature; formulas AST-parsed, parameterized (injection tests) |
+| Repudiation | disputed actions | append-only audit + exports + SIEM stream |
+| Info disclosure | cross-tenant/cross-customer reads | Postgres RLS + scoped sessions + attack-shaped tests (rival key, forged filter, parent->child) |
+| DoS | unbounded queries/AI | row/complexity limits, quotas, rate limits, embed view caps |
+| Elevation | role bypass | require() scopes per endpoint; owner-only paths; approval gates for actions |
 
-Out of MVP scope (documented, not ignored): per-tenant KMS keys, SSO/SAML,
-IP allowlists, row-level *user* permissions inside a tenant, DDoS (assumed at
-the edge/CDN), backup encryption.
+Residuals: XMLDSig chain (documented), CSP for embed pages served by nginx
+(frame-ancestors intentionally open for vendor iframes), no WAF in compose.

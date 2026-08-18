@@ -492,6 +492,81 @@ async def prep_suggestions(dataset_id: str,
                     "Nothing to suggest — this dataset already looks clean."}
 
 
+@router.post("/upload-json", status_code=201)
+async def upload_json(request: Request, file: UploadFile,
+                      workspace_id: str = Query(...),
+                      name: str = Query(..., min_length=1, max_length=255),
+                      ctx: TenantContext = Depends(require("dataset:create")),
+                      session=Depends(get_session)):
+    """R2: JSON upload — an array of flat objects (or {records: [...]}).
+    Converted to tabular form and fed through the SAME trust pipeline as
+    CSV (typing, quality, quarantine, scoring)."""
+    import csv as _csv
+    import io as _io
+    import json as _json
+
+    from starlette.datastructures import UploadFile as _SUF
+
+    from ..services.connectors.generic import records_to_result
+
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "Upload too large")
+    try:
+        payload = _json.loads(raw)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(422, "File is not valid JSON") from None
+    records = payload.get("records") if isinstance(payload, dict) else payload
+    if not isinstance(records, list) or not records:
+        raise HTTPException(422, 'Expected a JSON array of objects '
+                                 '(or {"records": [...]})')
+    res = records_to_result(records, None, None)
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(res.headers)
+    w.writerows(res.rows)
+    csv_file = _SUF(filename=(name or "data") + ".csv",
+                    file=_io.BytesIO(buf.getvalue().encode()))
+    return await upload(request=request, file=csv_file,
+                        workspace_id=workspace_id, name=name,
+                        ctx=ctx, session=session)
+
+
+@router.post("/{dataset_id}/pii-scan")
+async def pii_scan(dataset_id: str,
+                   ctx: TenantContext = Depends(require("tenant:manage")),
+                   session=Depends(get_session)):
+    """R1: scan sampled values per text column; SUGGEST classification —
+    apply via PUT /governance after human review."""
+    from sqlalchemy import text as _t
+
+    from ..services import pii
+
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    found = {}
+    for col in ds.schema_def:
+        if col["inferred_type"] != "text":
+            continue
+        rows = (await session.execute(_t(
+            "SELECT data->>:c FROM dataset_rows WHERE dataset_id = :d "
+            "AND import_id = :i LIMIT 200"),
+            {"c": col["name"], "d": str(ds.id),
+             "i": str(ds.current_import_id)})).scalars().all()
+        kind = pii.scan_column(rows)
+        if kind:
+            found[col["name"]] = kind
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="pii.scan",
+                       resource_type="dataset", resource_id=str(ds.id))
+    await session.commit()
+    return {"detected": found,
+            "suggested_governance": {"classification":
+                                     {c: "pii" for c in found}},
+            "note": "Nothing applied automatically — review and PUT "
+                    "/governance to classify, then column_policy to "
+                    "restrict."}
+
+
 @router.put("/{dataset_id}/governance")
 async def set_governance(dataset_id: str, body: dict,
                          ctx: TenantContext = Depends(require("tenant:manage")),
