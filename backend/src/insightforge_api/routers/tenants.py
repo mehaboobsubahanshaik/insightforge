@@ -475,3 +475,31 @@ async def set_custom_domain(body: DomainIn,
     return {"custom_domain": tenant.custom_domain,
             "next_steps": "Point a CNAME at the platform host; embeds and "
                           "portals will serve under it (docs/WHITE-LABEL.md)."}
+
+
+class SemanticsIn(BaseModel):
+    fiscal_year_start_month: int = Field(default=1, ge=1, le=12)
+    currency: dict = Field(default_factory=dict)  # {base, rates:{code:rate}}
+
+
+@router.put("/tenants/semantics")
+async def set_semantics(body: SemanticsIn,
+                        ctx: TenantContext = Depends(require("tenant:manage")),
+                        session=Depends(get_session)):
+    """R5: fiscal calendar + currency rates powering time grains and
+    conversion (rates are tenant-managed — the platform never guesses FX)."""
+    cur = body.currency or {}
+    for code, rate in (cur.get("rates") or {}).items():
+        if not (isinstance(rate, (int, float)) and rate > 0
+                and len(str(code)) == 3):
+            raise HTTPException(422, f"Bad rate for '{code}' — 3-letter "
+                                     "code and positive number required")
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    t.features = {**(t.features or {}),
+                  "semantics": body.model_dump()}
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="semantics.set",
+                       resource_type="tenant", resource_id=str(t.id))
+    await session.commit()
+    return {"semantics": t.features["semantics"]}

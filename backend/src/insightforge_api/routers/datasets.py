@@ -215,6 +215,106 @@ async def export_csv(dataset_id: str, ctx: TenantContext = Depends(require("data
         "Content-Disposition": f'attachment; filename="{safe_filename(ds.name, "csv")}"'})
 
 
+@router.get("/{dataset_id}/export.xlsx")
+async def export_xlsx(dataset_id: str,
+                      ctx: TenantContext = Depends(require("dataset:export")),
+                      session=Depends(get_session)):
+    """R4: Excel export with a WATERMARK sheet header — who exported what,
+    when, from which tenant. Export leakage becomes attributable."""
+    from datetime import datetime, timezone
+
+    from openpyxl import Workbook
+
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    table = await querysvc.fetch_table(
+        session, dataset_id=ds.id, current_import_id=ds.current_import_id,
+        dataset_schema=ds.schema_def, limit=querysvc.TABLE_LIMIT)
+    wb = Workbook()
+    sh = wb.active
+    sh.title = "data"
+    stamp = (f"CONFIDENTIAL · {ds.name} · exported "
+             f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+             f"· user {ctx.user_id} · tenant {ctx.tenant_id}")
+    sh.append([stamp])
+    sh.append(table["columns"])
+    for row in table["rows"]:
+        sh.append([neutralize_csv_cell(row.get(c))
+                   for c in table["columns"]])
+    sh.oddFooter.center.text = stamp[:250]
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="dataset.exported",
+                       resource_type="dataset", resource_id=str(ds.id),
+                       detail={"format": "xlsx"})
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/vnd.openxmlformats-officedocument"
+                        ".spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{safe_filename(ds.name, "xlsx")}"'})
+
+
+@router.get("/{dataset_id}/histogram")
+async def histogram(dataset_id: str, column: str, bins: int = 10,
+                    ctx: TenantContext = Depends(require("dataset:read")),
+                    session=Depends(get_session)):
+    """R4 viz data: deterministic equal-width binning for histogram charts
+    (renderable via SDK/embed or any client)."""
+    from sqlalchemy import text as _t
+
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    if bins < 2 or bins > 50:
+        raise HTTPException(422, "bins must be 2..50")
+    if column not in {c["name"] for c in ds.schema_def
+                      if c["inferred_type"] in ("number", "integer")}:
+        raise HTTPException(422, f"'{column}' is not a numeric column")
+    rows = (await session.execute(_t(
+        "SELECT (data->>:c)::numeric AS v FROM dataset_rows "
+        "WHERE dataset_id = :d AND import_id = :i "
+        "AND NOT is_quarantined AND data->>:c IS NOT NULL"),
+        {"c": column, "d": str(ds.id),
+         "i": str(ds.current_import_id)})).scalars().all()
+    vals = [float(v) for v in rows]
+    if not vals:
+        return {"bins": [], "column": column}
+    lo, hi = min(vals), max(vals)
+    width = (hi - lo) / bins or 1.0
+    counts = [0] * bins
+    for v in vals:
+        idx = min(int((v - lo) / width), bins - 1)
+        counts[idx] += 1
+    return {"column": column, "min": lo, "max": hi, "bin_width": width,
+            "bins": [{"from": round(lo + i * width, 4),
+                      "to": round(lo + (i + 1) * width, 4),
+                      "count": c} for i, c in enumerate(counts)]}
+
+
+@router.get("/{dataset_id}/scatter")
+async def scatter(dataset_id: str, x: str, y: str, limit: int = 500,
+                  ctx: TenantContext = Depends(require("dataset:read")),
+                  session=Depends(get_session)):
+    """R4 viz data: (x, y) pairs for scatter plots — governed, row-capped."""
+    from sqlalchemy import text as _t
+
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    numeric = {c["name"] for c in ds.schema_def
+               if c["inferred_type"] in ("number", "integer")}
+    if x not in numeric or y not in numeric:
+        raise HTTPException(422, "x and y must be numeric columns")
+    limit = max(10, min(limit, 2000))
+    rows = (await session.execute(_t(
+        "SELECT (data->>:x)::numeric, (data->>:y)::numeric FROM dataset_rows "
+        "WHERE dataset_id = :d AND import_id = :i AND NOT is_quarantined "
+        "AND data->>:x IS NOT NULL AND data->>:y IS NOT NULL "
+        "LIMIT :n"),
+        {"x": x, "y": y, "d": str(ds.id),
+         "i": str(ds.current_import_id), "n": limit})).all()
+    return {"x": x, "y": y,
+            "points": [[float(a), float(b)] for a, b in rows],
+            "capped_at": limit}
+
+
 # ---------------- AI insights (ml/ package) ----------------
 @router.get("/{dataset_id}/insights")
 async def insights(dataset_id: str, value_column: str, date_column: str,
@@ -492,6 +592,230 @@ async def prep_suggestions(dataset_id: str,
                     "Nothing to suggest — this dataset already looks clean."}
 
 
+class JoinIn(BaseModel):
+    left_id: str
+    right_id: str
+    left_key: str
+    right_key: str
+    name: str = Field(min_length=1, max_length=255)
+    how: str = Field(default="inner", pattern="^(inner|left)$")
+
+
+async def _rows_of(session, ds) -> list[dict]:
+    from sqlalchemy import text as _t
+
+    rows = (await session.execute(_t(
+        "SELECT data FROM dataset_rows WHERE dataset_id = :d "
+        "AND import_id = :i AND NOT is_quarantined"),
+        {"d": str(ds.id), "i": str(ds.current_import_id)})).scalars().all()
+    return list(rows)
+
+
+async def _materialize(request, session, ctx, workspace_id, name,
+                       headers, dicts):
+    """R5: turn derived rows into a NEW dataset through the SAME trust
+    pipeline (typing, quality, quarantine, lineage) via the CSV path."""
+    import csv as _csv
+    import io as _io
+
+    from starlette.datastructures import UploadFile as _SUF
+
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(headers)
+    for d in dicts:
+        w.writerow(["" if d.get(h) is None else str(d.get(h))
+                    for h in headers])
+    f = _SUF(filename=name + ".csv",
+             file=_io.BytesIO(buf.getvalue().encode()))
+    return await upload(request=request, file=f, workspace_id=workspace_id,
+                        name=name, ctx=ctx, session=session)
+
+
+@router.post("/join", status_code=201)
+async def join_datasets(request: Request, body: JoinIn,
+                        ctx: TenantContext = Depends(require("dataset:create")),
+                        session=Depends(get_session)):
+    """R5: governed cross-dataset join -> a new dataset. Right columns are
+    prefixed on collision; provenance in the description."""
+    left = await _dataset_or_404(session, ctx, body.left_id)
+    right = await _dataset_or_404(session, ctx, body.right_id)
+    lcols = {c["name"] for c in left.schema_def}
+    rcols = {c["name"] for c in right.schema_def}
+    if body.left_key not in lcols or body.right_key not in rcols:
+        raise HTTPException(422, "Join keys must exist in their datasets")
+    lrows, rrows = await _rows_of(session, left), await _rows_of(session, right)
+    if len(lrows) * max(len(rrows), 1) > 2_000_000:
+        raise HTTPException(422, "Join too large (cap 2M row pairs)")
+    index: dict = {}
+    for r in rrows:
+        index.setdefault(str(r.get(body.right_key)), []).append(r)
+    rename = {c: (c if c not in lcols or c == body.right_key
+                  else f"{right.name}_{c}") for c in rcols}
+    headers = list(lcols) + [rename[c] for c in rcols if c != body.right_key]
+    out = []
+    for lrow in lrows:
+        matches = index.get(str(lrow.get(body.left_key)), [])
+        if not matches and body.how == "left":
+            out.append(dict(lrow))
+        for m in matches:
+            merged = dict(lrow)
+            for c in rcols:
+                if c != body.right_key:
+                    merged[rename[c]] = m.get(c)
+            out.append(merged)
+    ds = await _materialize(request, session, ctx, str(left.workspace_id),
+                            body.name, headers, out)
+    return ds
+
+
+class PivotIn(BaseModel):
+    index: str
+    columns: str
+    value: str
+    name: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/{dataset_id}/pivot", status_code=201)
+async def pivot_dataset(request: Request, dataset_id: str, body: PivotIn,
+                        ctx: TenantContext = Depends(require("dataset:create")),
+                        session=Depends(get_session)):
+    """R5: cross-tab (sum) -> new dataset. index rows x columns values."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    names = {c["name"] for c in ds.schema_def}
+    if {body.index, body.columns, body.value} - names:
+        raise HTTPException(422, "index/columns/value must be columns")
+    rows = await _rows_of(session, ds)
+    col_vals = sorted({str(r.get(body.columns)) for r in rows})[:50]
+    table: dict = {}
+    for r in rows:
+        key = str(r.get(body.index))
+        cell = str(r.get(body.columns))
+        try:
+            v = float(r.get(body.value) or 0)
+        except (TypeError, ValueError):
+            continue
+        table.setdefault(key, dict.fromkeys(col_vals, 0.0))
+        if cell in table[key]:
+            table[key][cell] += v
+    headers = [body.index] + col_vals
+    out = [{body.index: k, **{c: round(v, 4) for c, v in cells.items()}}
+           for k, cells in sorted(table.items())]
+    return await _materialize(request, session, ctx, str(ds.workspace_id),
+                              body.name, headers, out)
+
+
+class DeriveIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    column: str = Field(min_length=1, max_length=120)
+    left: str
+    op: str = Field(pattern="^[-+*/]$")
+    right: str  # column name or numeric constant
+
+
+@router.post("/{dataset_id}/derive", status_code=201)
+async def derive_column(request: Request, dataset_id: str, body: DeriveIn,
+                        ctx: TenantContext = Depends(require("dataset:create")),
+                        session=Depends(get_session)):
+    """R5 formula column: left <op> right (column or constant) -> new
+    dataset with the derived column. Deterministic, no eval()."""
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    numeric = {c["name"] for c in ds.schema_def
+               if c["inferred_type"] in ("number", "integer")}
+    if body.left not in numeric:
+        raise HTTPException(422, f"'{body.left}' must be numeric")
+    const = None
+    if body.right not in numeric:
+        try:
+            const = float(body.right)
+        except ValueError:
+            raise HTTPException(422, f"'{body.right}' is neither a numeric "
+                                     "column nor a constant") from None
+    rows = await _rows_of(session, ds)
+    headers = [c["name"] for c in ds.schema_def] + [body.column]
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            a = float(r.get(body.left) or 0)
+            b = const if const is not None else float(r.get(body.right) or 0)
+            v = (a + b if body.op == "+" else a - b if body.op == "-"
+                 else a * b if body.op == "*" else (a / b if b else None))
+            d[body.column] = "" if v is None else round(v, 6)
+        except (TypeError, ValueError):
+            d[body.column] = ""
+        out.append(d)
+    return await _materialize(request, session, ctx, str(ds.workspace_id),
+                              body.name, headers, out)
+
+
+@router.get("/{dataset_id}/timeseries")
+async def timeseries(dataset_id: str, value: str, date: str,
+                     grain: str = "month", currency_to: str | None = None,
+                     ctx: TenantContext = Depends(require("dataset:read")),
+                     session=Depends(get_session)):
+    """R5 time grains + fiscal calendar + currency conversion in one
+    governed endpoint. grain: day|week|month|quarter|fiscal_quarter.
+    Fiscal year start + currency rates come from tenant semantics."""
+    from sqlalchemy import text as _t
+
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    numeric = {c["name"] for c in ds.schema_def
+               if c["inferred_type"] in ("number", "integer")}
+    dates = {c["name"] for c in ds.schema_def
+             if c["inferred_type"] in ("date", "timestamp")}
+    if value not in numeric or date not in dates:
+        raise HTTPException(422, "value must be numeric, date must be a "
+                                 "date column")
+    if grain not in ("day", "week", "month", "quarter", "fiscal_quarter"):
+        raise HTTPException(422, "grain: day|week|month|quarter|"
+                                 "fiscal_quarter")
+    from ..models import Tenant as _T
+
+    tenant = (await session.execute(select(_T).where(
+        _T.id == ctx.tenant_id))).scalar_one()
+    sem = (tenant.features or {}).get("semantics", {})
+    fy_start = int(sem.get("fiscal_year_start_month", 1))
+    rate = 1.0
+    if currency_to:
+        rates = (sem.get("currency") or {}).get("rates") or {}
+        base = (sem.get("currency") or {}).get("base", "")
+        if currency_to == base:
+            rate = 1.0
+        elif currency_to in rates:
+            rate = float(rates[currency_to])
+        else:
+            raise HTTPException(422, f"No rate for {currency_to}; set it "
+                                     "via PUT /tenants/semantics")
+    sql_grain = "month" if grain in ("quarter", "fiscal_quarter") else grain
+    rows = (await session.execute(_t(
+        "SELECT date_trunc(:g, (data->>:dc)::date)::date AS p, "
+        "sum((data->>:vc)::numeric) AS v FROM dataset_rows "
+        "WHERE dataset_id = :d AND import_id = :i AND NOT is_quarantined "
+        "AND data->>:dc IS NOT NULL AND data->>:vc IS NOT NULL "
+        "GROUP BY 1 ORDER BY 1"),
+        {"g": sql_grain, "dc": date, "vc": value, "d": str(ds.id),
+         "i": str(ds.current_import_id)})).all()
+    if grain in ("quarter", "fiscal_quarter"):
+        agg: dict = {}
+        for p, v in rows:
+            if grain == "quarter":
+                label = f"{p.year}-Q{(p.month - 1) // 3 + 1}"
+            else:
+                shifted = (p.month - fy_start + 12) % 12
+                fy = p.year + (1 if p.month >= fy_start and fy_start > 1
+                               else 0)
+                label = f"FY{fy}-Q{shifted // 3 + 1}"
+            agg[label] = agg.get(label, 0.0) + float(v)
+        points = [{"period": k, "value": round(v * rate, 2)}
+                  for k, v in sorted(agg.items())]
+    else:
+        points = [{"period": p.isoformat(),
+                   "value": round(float(v) * rate, 2)} for p, v in rows]
+    return {"grain": grain, "fiscal_year_start_month": fy_start,
+            "currency": currency_to, "rate_applied": rate, "points": points}
+
+
 @router.post("/upload-json", status_code=201)
 async def upload_json(request: Request, file: UploadFile,
                       workspace_id: str = Query(...),
@@ -530,6 +854,86 @@ async def upload_json(request: Request, file: UploadFile,
     return await upload(request=request, file=csv_file,
                         workspace_id=workspace_id, name=name,
                         ctx=ctx, session=session)
+
+
+class AlertLifecycleIn(BaseModel):
+    quiet_start: str | None = Field(default=None,
+                                    pattern="^([01]\\d|2[0-3]):[0-5]\\d$")
+    quiet_end: str | None = Field(default=None,
+                                  pattern="^([01]\\d|2[0-3]):[0-5]\\d$")
+    escalate_after_minutes: int | None = Field(default=None, ge=5, le=1440)
+    escalate_to: str | None = None
+
+
+@router.put("/{dataset_id}/alerts/{rule_id}/lifecycle")
+async def set_alert_lifecycle(dataset_id: str, rule_id: str,
+                              body: AlertLifecycleIn,
+                              ctx: TenantContext = Depends(
+                                  require("dataset:create")),
+                              session=Depends(get_session)):
+    """R6: quiet hours (UTC) + escalation policy per alert rule."""
+    from ..models import AlertRule
+
+    rule = (await session.execute(select(AlertRule).where(
+        AlertRule.id == rule_id, AlertRule.tenant_id == ctx.tenant_id,
+        AlertRule.dataset_id == dataset_id))).scalar_one_or_none()
+    if rule is None:
+        raise HTTPException(404, "Alert rule not found")
+    rule.lifecycle = {k: v for k, v in body.model_dump().items()
+                      if v is not None}
+    await session.commit()
+    return {"lifecycle": rule.lifecycle}
+
+
+@router.post("/{dataset_id}/alerts/{rule_id}/ack")
+async def ack_alert(dataset_id: str, rule_id: str,
+                    ctx: TenantContext = Depends(require("dataset:read")),
+                    session=Depends(get_session)):
+    """R6: acknowledge the latest firing — stops escalation, audited."""
+    from ..models import AlertEvent
+
+    ev = (await session.execute(select(AlertEvent).where(
+        AlertEvent.rule_id == rule_id,
+        AlertEvent.tenant_id == ctx.tenant_id).order_by(
+        AlertEvent.fired_at.desc()))).scalars().first()
+    if ev is None:
+        raise HTTPException(404, "No firings to acknowledge")
+    if ev.acked_at is None:
+        from datetime import datetime, timezone
+
+        ev.acked_at = datetime.now(timezone.utc)
+        ev.acked_by = ctx.user_id
+        await audit.record(session, tenant_id=ctx.tenant_id,
+                           actor_user_id=ctx.user_id, action="alert.ack",
+                           resource_type="alert", resource_id=str(rule_id))
+        await session.commit()
+    return {"acked_at": ev.acked_at.isoformat(), "by": str(ev.acked_by)}
+
+
+class IssueIn(BaseModel):
+    description: str = Field(min_length=5, max_length=2000)
+
+
+@router.post("/{dataset_id}/issues", status_code=201)
+async def report_data_issue(dataset_id: str, body: IssueIn,
+                            ctx: TenantContext = Depends(
+                                require("dataset:read")),
+                            session=Depends(get_session)):
+    """R6 collaboration: anyone who can read can flag a data issue; it
+    lands in the approvals queue for admins to resolve."""
+    from ..models import Approval, uuid7
+
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    a = Approval(id=uuid7(), tenant_id=ctx.tenant_id, kind="data_issue",
+                 subject_id=str(ds.id), note=body.description,
+                 requested_by=ctx.user_id)
+    session.add(a)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="issue.report",
+                       resource_type="dataset", resource_id=str(ds.id))
+    await session.commit()
+    return {"id": str(a.id), "status": "pending",
+            "note": "Visible in the approvals queue (kind: data_issue)."}
 
 
 @router.post("/{dataset_id}/pii-scan")

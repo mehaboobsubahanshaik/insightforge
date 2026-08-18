@@ -194,12 +194,71 @@ _OPS = {"gt": lambda v, t: v > t, "gte": lambda v, t: v >= t,
         "lt": lambda v, t: v < t, "lte": lambda v, t: v <= t}
 
 
+def _in_quiet_hours(lifecycle: dict, now_hm: str) -> bool:
+    qs, qe = lifecycle.get("quiet_start"), lifecycle.get("quiet_end")
+    if not qs or not qe:
+        return False
+    if qs <= qe:
+        return qs <= now_hm < qe
+    return now_hm >= qs or now_hm < qe  # window crosses midnight
+
+
+async def run_escalations_once() -> int:
+    """R6: unacked firings past their rule's escalation window get ONE
+    escalation email to the configured address."""
+    from datetime import datetime, timedelta, timezone
+
+    from .db import session_factory, tenant_scoped_session
+    from .models import AlertEvent, AlertRule
+    from .services import mailer
+
+    sent = 0
+    async with session_factory()() as s:
+        rules = (await s.execute(select(AlertRule))).scalars().all()
+    for rule in rules:
+        lc = rule.lifecycle or {}
+        mins, to = lc.get("escalate_after_minutes"), lc.get("escalate_to")
+        if not mins or not to:
+            continue
+        async with tenant_scoped_session(rule.tenant_id) as ts:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=mins)
+            evs = (await ts.execute(select(AlertEvent).where(
+                AlertEvent.rule_id == rule.id,
+                AlertEvent.acked_at.is_(None),
+                AlertEvent.fired_at < cutoff))).scalars().all()
+            for ev in evs:
+                if (ev.message or "").endswith("[escalated]"):
+                    continue
+                await mailer.send(
+                    ts, tenant_id=rule.tenant_id, to_email=to,
+                    kind="alert",
+                    subject=f"ESCALATION: '{rule.name}' unacknowledged",
+                    body=f"Alert '{rule.name}' fired at "
+                         f"{ev.fired_at.isoformat()} (value {ev.value}) "
+                         f"and has not been acknowledged for {mins}+ "
+                         "minutes.")
+                ev.message = (ev.message or "") + " [escalated]"
+                sent += 1
+            await ts.commit()
+    return sent
+
+
 async def run_due_alerts_once() -> int:
     fired = 0
     for rule_id, tenant_id in await _due(AlertRule, AlertRule.next_check_at):
         async with tenant_scoped_session(tenant_id) as s:
             rule = (await s.execute(select(AlertRule).where(
                 AlertRule.id == rule_id))).scalar_one_or_none()
+            if rule is not None:
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+
+                hm = _dt.now(_tz.utc).strftime("%H:%M")
+                if _in_quiet_hours(rule.lifecycle or {}, hm):
+                    rule.next_check_at = _dt.now(_tz.utc) + timedelta(
+                        minutes=rule.interval_minutes)
+                    await s.commit()
+                    continue
             if rule is None:
                 continue
             now = datetime.now(timezone.utc)
@@ -465,6 +524,7 @@ async def scheduler_loop(poll_seconds: float = 15.0):
             await run_lifecycle_once()
             await run_siem_once()
             await run_proactive_forecasts_once()
+            await run_escalations_once()
         except Exception:  # noqa: BLE001 - the loop itself must survive anything
             log.exception("scheduler tick failed")
         await asyncio.sleep(poll_seconds)

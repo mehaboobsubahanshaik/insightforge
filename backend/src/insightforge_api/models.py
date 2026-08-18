@@ -387,6 +387,7 @@ class AlertRule(Base):
     formula: Mapped[str] = mapped_column(String(500))
     operator: Mapped[str] = mapped_column(String(8))  # gt|gte|lt|lte
     threshold: Mapped[float] = mapped_column()
+    lifecycle: Mapped[dict] = mapped_column(JSONB, default=dict)
     interval_minutes: Mapped[int] = mapped_column(default=60)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     recipients: Mapped[list] = mapped_column(JSONB, default=list)
@@ -405,6 +406,10 @@ class AlertEvent(Base):
     value: Mapped[float | None] = mapped_column(nullable=True)
     message: Mapped[str] = mapped_column(Text, default="")
     fired_at: Mapped[datetime] = _now()
+    acked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    acked_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True)
 
 
 class EmailOutbox(Base):
