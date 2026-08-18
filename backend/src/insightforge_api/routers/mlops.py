@@ -257,3 +257,188 @@ async def configure_azure(body: AzureIn,
                        resource_type="ml_model", resource_id=str(m.id))
     await session.commit()
     return {"registered": str(m.id), "azure_ml": t.features["azure_ml"]}
+
+
+# ---- A3: causal, simulation, private models, governance ----
+class CausalIn(BaseModel):
+    dataset_id: str
+    value_column: str
+    date_column: str
+    group_column: str
+    treated_value: str
+    intervention_date: str  # ISO date
+
+
+@router.post("/causal")
+async def causal_experiment(body: CausalIn,
+                            ctx: TenantContext = Depends(require("dataset:read")),
+                            session=Depends(get_session)):
+    """Causal analysis WHERE METHODOLOGICALLY VALID: difference-in-differences
+    with explicit validity gates — missing control, thin cells, or diverging
+    pre-trends produce a refusal, not a number."""
+    ds = (await session.execute(select(Dataset).where(
+        Dataset.id == body.dataset_id,
+        Dataset.tenant_id == ctx.tenant_id))).scalar_one_or_none()
+    if ds is None:
+        raise HTTPException(404, "Dataset not found")
+
+    async def cell(treated: bool, post: bool):
+        op = "eq" if treated else "neq"
+        from datetime import date as _date
+        from datetime import timedelta as _td
+
+        cut = body.intervention_date
+        pre_end = (_date.fromisoformat(cut) - _td(days=1)).isoformat()
+        dop = "date_gte" if post else "date_lte"
+        bound = cut if post else pre_end
+        r = await querysvc.execute_formula(
+            session, dataset_id=ds.id, current_import_id=ds.current_import_id,
+            dataset_schema=ds.schema_def, formula=f"avg({body.value_column})",
+            group_by=body.date_column,
+            filters=[{"column": body.group_column, "op": op,
+                      "value": body.treated_value},
+                     {"column": body.date_column, "op": dop,
+                      "value": bound}])
+        vals = [float(g["value"] or 0) for g in r["groups"]
+                if g["group"] is not None]
+        return vals
+
+    tp, tq = await cell(True, False), await cell(True, True)
+    cp, cq = await cell(False, False), await cell(False, True)
+    for name, vals in (("treated pre", tp), ("treated post", tq),
+                       ("control pre", cp), ("control post", cq)):
+        if len(vals) < 3:
+            return {"valid": False,
+                    "refusal": f"Not methodologically valid: '{name}' cell "
+                               f"has {len(vals)} daily points (< 3). "
+                               "A causal estimate here would be noise."}
+    t_trend = (tp[-1] - tp[0]) / max(len(tp) - 1, 1)
+    c_trend = (cp[-1] - cp[0]) / max(len(cp) - 1, 1)
+    denom = max(abs(t_trend), abs(c_trend), 1e-9)
+    if abs(t_trend - c_trend) / denom > 0.5 and denom > 1e-6:
+        return {"valid": False,
+                "refusal": "Parallel-trends check failed: treated and "
+                           "control were already diverging before the "
+                           "intervention "
+                           f"({t_trend:.2f} vs {c_trend:.2f} per day). "
+                           "Difference-in-differences is invalid here."}
+    did = ((sum(tq) / len(tq)) - (sum(tp) / len(tp))) - (
+        (sum(cq) / len(cq)) - (sum(cp) / len(cp)))
+    return {"valid": True, "method": "difference-in-differences",
+            "estimate": round(did, 2),
+            "cells": {"treated_pre_mean": round(sum(tp) / len(tp), 2),
+                      "treated_post_mean": round(sum(tq) / len(tq), 2),
+                      "control_pre_mean": round(sum(cp) / len(cp), 2),
+                      "control_post_mean": round(sum(cq) / len(cq), 2)},
+            "caveat": "Observational estimate under the parallel-trends "
+                      "assumption — not a randomized experiment."}
+
+
+class SimulateIn(WhatIfIn):
+    horizon: int = Field(default=6, ge=1, le=24)
+    date_column: str
+
+
+@router.post("/simulate")
+async def simulate(body: SimulateIn,
+                   ctx: TenantContext = Depends(require("dataset:read")),
+                   session=Depends(get_session)):
+    """Digital scenario simulation: forecast the baseline trajectory, then
+    project it under the scenario's segment adjustments — both curves
+    returned, method stated."""
+    from insightforge_ml import forecast_series
+
+    ds = (await session.execute(select(Dataset).where(
+        Dataset.id == body.dataset_id,
+        Dataset.tenant_id == ctx.tenant_id))).scalar_one_or_none()
+    if ds is None:
+        raise HTTPException(404, "Dataset not found")
+    series = await _series(session, ds, body.value_column, body.date_column)
+    if len(series) < 5:
+        raise HTTPException(422, "Need at least 5 points to simulate")
+    wi = await _what_if(session, ctx, WhatIfIn(
+        dataset_id=body.dataset_id, value_column=body.value_column,
+        adjustments=body.adjustments))
+    ratio = (wi["adjusted"] / wi["baseline"]) if wi["baseline"] else 1.0
+    f = forecast_series(series, horizon=body.horizon)
+    base_traj = [p["forecast"] for p in f["points"]]
+    return {"baseline_trajectory": [round(v, 2) for v in base_traj],
+            "scenario_trajectory": [round(v * ratio, 2) for v in base_traj],
+            "scenario_ratio": round(ratio, 4),
+            "assumption": "segment adjustments hold at constant share over "
+                          "the horizon; trajectories from the same "
+                          "explainable Holt fit as Insights."}
+
+
+class PrivateModelIn(BaseModel):
+    endpoint_url: str = Field(pattern="^https://", max_length=500)
+    model_name: str = Field(min_length=1, max_length=200)
+
+
+@router.put("/private-model")
+async def configure_private_model(body: PrivateModelIn,
+                                  ctx: TenantContext = Depends(
+                                      require("tenant:manage")),
+                                  session=Depends(get_session)):
+    """Private-model deployment support: registers a customer-hosted model
+    endpoint (external kind); invocation wiring documented, never faked."""
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    t.features = {**(t.features or {}), "private_model": body.model_dump()}
+    m = MLModel(id=uuid7(), tenant_id=ctx.tenant_id,
+                name=f"private:{body.model_name}", kind="external",
+                config={**body.model_dump(), "risk_tier": "high"},
+                metrics={"status": "configured, not yet invoked"})
+    session.add(m)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="ml.private_model",
+                       resource_type="ml_model", resource_id=str(m.id))
+    await session.commit()
+    return {"registered": str(m.id),
+            "risk_tier": "high (external models default high until reviewed)"}
+
+
+class RiskIn(BaseModel):
+    tier: str = Field(pattern="^(low|medium|high)$")
+    notes: str = Field(default="", max_length=1000)
+
+
+@router.put("/models/{model_id}/risk")
+async def set_risk(model_id: str, body: RiskIn,
+                   ctx: TenantContext = Depends(require("tenant:manage")),
+                   session=Depends(get_session)):
+    m = (await session.execute(select(MLModel).where(
+        MLModel.id == model_id,
+        MLModel.tenant_id == ctx.tenant_id))).scalar_one_or_none()
+    if m is None:
+        raise HTTPException(404, "Model not found")
+    m.config = {**m.config, "risk_tier": body.tier, "risk_notes": body.notes}
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="ml.risk_tier",
+                       resource_type="ml_model", resource_id=str(m.id))
+    await session.commit()
+    return {"risk_tier": body.tier}
+
+
+@router.get("/governance")
+async def model_governance(ctx: TenantContext = Depends(require("usage:read")),
+                           session=Depends(get_session)):
+    """Advanced AI governance: the model-risk report — every model with
+    kind, status, risk tier, drift; plus the platform controls in force."""
+    rows = (await session.execute(select(MLModel).where(
+        MLModel.tenant_id == ctx.tenant_id))).scalars().all()
+    return {"models": [{"name": m.name, "kind": m.kind, "status": m.status,
+                        "risk_tier": (m.config or {}).get("risk_tier",
+                                                          "unreviewed"),
+                        "drift": (m.metrics or {}).get("drift")}
+                       for m in rows],
+            "high_risk_count": sum(1 for m in rows
+                                   if (m.config or {}).get("risk_tier")
+                                   == "high"),
+            "controls": ["daily AI question quotas per plan",
+                         "every AI/agent call audited",
+                         "agents observe-only; action requires human "
+                         "approval",
+                         "eval suite in CI (docs/AI-EVALS.md)",
+                         "drift monitoring on forecast models",
+                         "external/private models default high risk"]}

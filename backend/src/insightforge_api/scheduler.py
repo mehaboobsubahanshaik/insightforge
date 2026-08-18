@@ -409,6 +409,51 @@ async def run_siem_once() -> int:
     return shipped
 
 
+async def run_proactive_forecasts_once() -> int:
+    """Proactive forecasting (MVP6 A3): for each registered forecast model,
+    forecast the next step; a projected breach (>30% off the recent mean)
+    emits a forecast.breach webhook event — the forecast comes to you."""
+    from insightforge_ml import forecast_series
+
+    from .db import session_factory, tenant_scoped_session
+    from .models import Dataset, MLModel
+    from .routers.mlops import _series
+    from .services import notify
+
+    fired = 0
+    async with session_factory()() as s:
+        models = (await s.execute(select(MLModel).where(
+            MLModel.kind == "forecast",
+            MLModel.status == "active"))).scalars().all()
+    for m in models:
+        async with tenant_scoped_session(m.tenant_id) as ts:
+            ds = (await ts.execute(select(Dataset).where(
+                Dataset.id == m.dataset_id))).scalar_one_or_none()
+            if ds is None:
+                continue
+            try:
+                series = await _series(ts, ds, m.config["value_column"],
+                                       m.config["date_column"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("proactive forecast skip %s: %s", m.name, e)
+                continue
+            if len(series) < 5:
+                continue
+            nxt = forecast_series(series, horizon=1)["points"][0]["forecast"]
+            recent = sum(series[-7:]) / len(series[-7:])
+            if recent and abs(nxt - recent) / abs(recent) > 0.3:
+                await notify.deliver_event(ts, m.tenant_id,
+                                           "forecast.breach", {
+                    "message": f"Model '{m.name}': next-step forecast "
+                               f"{nxt:,.0f} deviates "
+                               f"{abs(nxt - recent) / abs(recent) * 100:.0f}%"
+                               f" from the recent mean {recent:,.0f}.",
+                    "model_id": str(m.id)})
+                await ts.commit()
+                fired += 1
+    return fired
+
+
 async def scheduler_loop(poll_seconds: float = 15.0):
     log.info("scheduler started (poll every %ss)", poll_seconds)
     while True:
@@ -419,6 +464,7 @@ async def scheduler_loop(poll_seconds: float = 15.0):
             await run_due_alerts_once()
             await run_lifecycle_once()
             await run_siem_once()
+            await run_proactive_forecasts_once()
         except Exception:  # noqa: BLE001 - the loop itself must survive anything
             log.exception("scheduler tick failed")
         await asyncio.sleep(poll_seconds)

@@ -154,7 +154,7 @@ async def impact_analysis(dataset_id: str,
 
 # ---- certification via approval workflow ----
 class ApprovalIn(BaseModel):
-    kind: str = Field(pattern="^(certify_dataset)$")
+    kind: str = Field(pattern="^(certify_dataset|action_plan)$")
     subject_id: str
     note: str = ""
 
@@ -201,6 +201,26 @@ async def decide_approval(approval_id: str, body: DecideIn,
     a.status = "approved" if body.decision == "approve" else "rejected"
     a.decided_by = ctx.user_id
     a.decided_at = datetime.now(timezone.utc)
+    if a.status == "approved" and a.kind == "action_plan":
+        from ..models import MLModel
+        from ..services import querysvc as _q
+
+        plan = (await session.execute(select(MLModel).where(
+            MLModel.id == a.subject_id,
+            MLModel.tenant_id == ctx.tenant_id,
+            MLModel.kind == "action_plan"))).scalar_one_or_none()
+        if plan is not None:
+            plan.status = "approved"
+            metric = plan.config.get("metric") or {}
+            ds = (await session.execute(select(Dataset).where(
+                Dataset.id == metric.get("dataset_id")))).scalar_one_or_none()
+            if ds is not None:
+                baseline = (await _q.execute_formula(
+                    session, dataset_id=ds.id,
+                    current_import_id=ds.current_import_id,
+                    dataset_schema=ds.schema_def,
+                    formula=metric["formula"], filters=[]))["value"]
+                plan.metrics = {**plan.metrics, "baseline": baseline}
     if a.status == "approved" and a.kind == "certify_dataset":
         ds = (await session.execute(select(Dataset).where(
             Dataset.id == a.subject_id,

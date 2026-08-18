@@ -70,7 +70,8 @@ async function renderDataset(){
     <div class="row" style="margin-top:.5rem">
       <input id="ask-q" placeholder='e.g. "total by region", "average quantity last month", "top 3 products by total"'
         style="flex:1" onkeydown="if(event.key==='Enter')runAsk()">
-      <button class="btn" onclick="runAsk()">Ask</button></div>
+      <button class="btn-ghost" onclick="voiceAsk()" title="Ask by voice">🎤</button>
+    <button class="btn" onclick="runAsk()">Ask</button></div>
     <div id="ask-out"></div>
   </div>
   <div class="grid two" style="margin-bottom:1rem">
@@ -331,3 +332,15 @@ async function sendFeedback(kind,subject,helpful){
   try{await api('/ai/feedback',{method:'POST',json:{kind,subject,helpful}});
     toast(helpful?'Thanks!':'Thanks — noted for the eval suite')}
   catch(e){toast(e.message,true)}}
+
+
+/* ---- MVP6 A3: voice-based analytics (Web Speech API -> governed NLQ) ---- */
+function voiceAsk(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){toast('Voice input needs Chrome/Edge (Web Speech API)',true);return}
+  const r=new SR();r.lang=document.documentElement.lang==='hi'?'hi-IN':'en-US';
+  toast('Listening… ask your question');
+  r.onresult=e=>{const q=e.results[0][0].transcript;
+    document.getElementById('ask-q').value=q;runAsk()};
+  r.onerror=e=>toast('Voice: '+e.error,true);
+  r.start()}
