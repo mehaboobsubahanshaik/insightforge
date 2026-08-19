@@ -155,6 +155,25 @@ function renderWidget(i,wd){
       axisLabel:{fontSize:8,distance:18},pointer:{width:4},
       detail:{fontSize:16,offsetCenter:[0,'62%'],formatter:x=>Number(x).toLocaleString()},
       data:[{value:v}]}]})}
+  else if(wd.type==='bullet'){const v=Number(wd.value||0);
+    const mx=wd.max||Math.max(v,wd.target||0)*1.2||1;
+    ch.setOption({grid:{left:8,right:20,top:14,bottom:8,containLabel:true},
+      xAxis:{type:'value',max:mx,axisLabel:{fontSize:9}},
+      yAxis:{type:'category',data:[''],axisLine:{show:false}},
+      series:[{type:'bar',barWidth:18,data:[v],
+        itemStyle:{color:'#4F46E5',borderRadius:4},
+        markLine:wd.target?{symbol:'none',lineStyle:{color:'#dc2626',width:2},
+          label:{formatter:'target',fontSize:9},
+          data:[{xAxis:wd.target}]}:undefined}]})}
+  else if(wd.type==='control'){const c=wd.control||{};
+    ch.setOption({...base,tooltip:{trigger:'axis'},
+      series:[{type:'line',symbolSize:7,data:(wd.groups||[]).map(r=>({
+        value:r.value,itemStyle:(c.out_of_control||[]).includes(r.group)?
+          {color:'#dc2626'}:{color:'#4F46E5'}})),
+        markLine:{symbol:'none',label:{fontSize:8},data:[
+          ...(c.mean!=null?[{yAxis:c.mean,lineStyle:{color:'#16a34a'},label:{formatter:'mean'}}]:[]),
+          ...(c.ucl!=null?[{yAxis:c.ucl,lineStyle:{color:'#f59e0b',type:'dashed'},label:{formatter:'UCL'}}]:[]),
+          ...(c.lcl!=null?[{yAxis:c.lcl,lineStyle:{color:'#f59e0b',type:'dashed'},label:{formatter:'LCL'}}]:[])]}}]})}
   else if(wd.type==='scatter'){ch.setOption({grid:base.grid,tooltip:{trigger:'item',
       formatter:p=>`${wd.x_column}: ${p.value[0]}<br>${wd.y_column}: ${p.value[1]}`},
     xAxis:{type:'value',name:wd.x_column,nameTextStyle:{fontSize:9},axisLabel:{fontSize:10}},
@@ -208,7 +227,7 @@ function openAddWidget(){
     <option value="table">Table (latest rows)</option><option value="pivot">Pivot (two-way)</option>
     <option value="funnel">Funnel</option><option value="waterfall">Waterfall</option>
     <option value="gauge">Gauge</option><option value="scatter">Scatter plot</option>
-    <option value="histogram">Histogram</option></select>
+    <option value="histogram">Histogram</option><option value="bullet">Bullet</option><option value="control">Control chart</option></select>
   <label>Title</label><input id="aw-title" placeholder="e.g. Revenue by region">
   <label>Dataset</label><select id="aw-ds" onchange="awDsChanged()">${ds.map(d=>`<option value="${d.id}">${esc(d.name)}</option>`).join('')}</select>
   <div id="aw-fields"></div>
@@ -232,6 +251,7 @@ function awTypeChanged(){
     <input id="aw-formula" class="mono" value="${nums.length?`sum(${esc(nums[0])})`:'count()'}">
     ${!['kpi','gauge'].includes(t)?`<label>Group by</label><select id="aw-cat">${cats.map(c=>`<option>${esc(c)}</option>`).join('')}</select>`:''}
     ${t==='gauge'?`<label>Gauge max (blank = auto)</label><input id="aw-max" type="number" placeholder="e.g. 100000">`:''}
+    ${t==='bullet'?`<label>Target</label><input id="aw-target" type="number" placeholder="goal value"><label>Max (blank = auto)</label><input id="aw-max" type="number">`:''}
     ${t==='pivot'?`<label>Then by (columns)</label><select id="aw-cat2">${cats.map(c=>`<option>${esc(c)}</option>`).join('')}</select>`:''}`}
   $('#aw-fields').innerHTML=html}
 async function addWidget(){
@@ -242,8 +262,9 @@ async function addWidget(){
   else if(t==='histogram'){w.x_column=$('#aw-x').value;w.bins=Number($('#aw-bins').value)||10}
   else{w.formula=$('#aw-formula').value.trim();
     if(!w.formula){toast('Write a formula, e.g. sum(total)',true);return}
-    if(!['kpi','gauge'].includes(t))w.group_by=$('#aw-cat').value;
+    if(!['kpi','gauge','bullet'].includes(t))w.group_by=$('#aw-cat').value;
     if(t==='gauge'&&$('#aw-max').value)w.max=Number($('#aw-max').value);
+    if(t==='bullet'){if($('#aw-target').value)w.target=Number($('#aw-target').value);if($('#aw-max').value)w.max=Number($('#aw-max').value)}
     if(t==='pivot')w.group_by2=$('#aw-cat2').value}
   if(['table','pivot'].includes(t))w.width='full';
   DB.widgets.push(w);

@@ -39,7 +39,7 @@ router = APIRouter(prefix="/api/v1", tags=["dashboards"])
 
 WIDGET_TYPES = {"kpi", "bar", "line", "area", "pie", "donut", "table",
                 "pivot", "funnel", "waterfall", "gauge", "scatter",
-                "histogram"}
+                "histogram", "bullet", "control"}
 MAX_WIDGETS = 24
 
 
@@ -104,12 +104,21 @@ async def _validate_widgets(session, ctx, widgets: list) -> list:
                 raise HTTPException(422, f"Widget {i + 1} formula error: {e}") from None
             clean["formula"] = formula
             if wtype in ("bar", "line", "area", "pie", "donut", "pivot",
-                         "funnel", "waterfall"):
+                         "funnel", "waterfall", "control"):
                 gb = w.get("group_by")
                 if gb not in columns:
                     raise HTTPException(422, f"Widget {i + 1}: group_by must be a dataset "
                                              f"column")
                 clean["group_by"] = gb
+            if wtype == "bullet":
+                for fld in ("target", "max"):
+                    if w.get(fld) is not None:
+                        try:
+                            clean[fld] = float(w[fld])
+                        except (TypeError, ValueError):
+                            raise HTTPException(
+                                422, f"Widget {i + 1}: {fld} must be "
+                                     "numeric") from None
             if wtype == "gauge":
                 try:
                     clean["max"] = float(w.get("max")) if w.get("max") \
@@ -306,7 +315,7 @@ async def _hydrate(session, tenant_id, widgets: list, filters: list[dict]) -> di
                     session, dataset_id=ds.id, current_import_id=ds.current_import_id,
                     dataset_schema=ds.schema_def, formula=w["formula"],
                     group_by=w["group_by"], group_by2=w["group_by2"], filters=applicable))
-            elif w["type"] in ("kpi", "gauge"):
+            elif w["type"] in ("kpi", "gauge", "bullet"):
                 item.update(await querysvc.execute_formula(
                     session, dataset_id=ds.id, current_import_id=ds.current_import_id,
                     dataset_schema=ds.schema_def, formula=w["formula"], filters=applicable))
@@ -350,6 +359,23 @@ async def _hydrate(session, tenant_id, widgets: list, filters: list[dict]) -> di
                     session, dataset_id=ds.id, current_import_id=ds.current_import_id,
                     dataset_schema=ds.schema_def, formula=w["formula"],
                     group_by=w["group_by"], filters=applicable))
+                if w["type"] == "control" and item.get("groups"):
+                    vals = [g["value"] for g in item["groups"]
+                            if g["value"] is not None]
+                    if len(vals) >= 2:
+                        mean = sum(vals) / len(vals)
+                        # XmR moving-range sigma estimate (control-chart
+                        # standard): robust to the very spikes we hunt
+                        mrs = [abs(b - a) for a, b in zip(vals, vals[1:])]
+                        sigma = (sum(mrs) / len(mrs)) / 1.128
+                        item["control"] = {
+                            "mean": round(mean, 4),
+                            "ucl": round(mean + 3 * sigma, 4),
+                            "lcl": round(mean - 3 * sigma, 4),
+                            "out_of_control": [
+                                g["group"] for g in item["groups"]
+                                if g["value"] is not None and abs(
+                                    g["value"] - mean) > 3 * sigma]}
         except querysvc.QueryError as e:
             item["error"] = str(e)
         out.append(item)
@@ -611,6 +637,8 @@ class CommentIn(BaseModel):
     body: str = Field(min_length=1, max_length=4000)
     parent_id: str | None = None
     mentions: list[str] = []
+    widget_anchor: int | None = Field(default=None, ge=0, le=29)
+
 
 
 @router.get("/dashboards/{dashboard_id}/comments")
@@ -621,7 +649,7 @@ async def list_comments(dashboard_id: str,
     rows = (await session.execute(
         select(Comment, User.display_name).join(User, User.id == Comment.author_id)
         .where(Comment.dashboard_id == d.id).order_by(Comment.created_at))).all()
-    return [{"id": str(c.id), "author": name, "body": c.body,
+    return [{"id": str(c.id), "author": name, "body": c.body, "widget_anchor": c.widget_anchor,
              "parent_id": str(c.parent_id) if c.parent_id else None,
              "mentions": c.mentions, "at": c.created_at.isoformat()} for c, name in rows]
 
@@ -639,6 +667,10 @@ async def add_comment(dashboard_id: str, body: CommentIn,
         if parent is None:
             raise HTTPException(404, "Parent comment not found")
         parent_id = pid
+    if body.widget_anchor is not None and \
+            body.widget_anchor >= len(d.widgets):
+        raise HTTPException(422, "widget_anchor beyond this dashboard's "
+                                 "widgets")
     valid_mentions = []
     for email in body.mentions[:10]:
         member = (await session.execute(
@@ -649,7 +681,8 @@ async def add_comment(dashboard_id: str, body: CommentIn,
             raise HTTPException(422, f"@{email} is not a member of this organization")
         valid_mentions.append(member.email)
     c = Comment(tenant_id=ctx.tenant_id, dashboard_id=d.id, author_id=ctx.user_id,
-                parent_id=parent_id, body=body.body, mentions=valid_mentions)
+                parent_id=parent_id, body=body.body, mentions=valid_mentions,
+                widget_anchor=body.widget_anchor)
     session.add(c)
     await session.flush()
     if valid_mentions:
@@ -854,3 +887,48 @@ async def take_snapshot(dashboard_id: str, view: str = "published",
     await session.commit()
     return {"file": fname, "taken_at": snap["taken_at"],
             "widgets": len(snap["widgets"])}
+
+
+class CollectionIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    dashboard_ids: list[str] = Field(min_length=1, max_length=50)
+
+
+@router.post("/collections", status_code=201)
+async def create_collection(body: CollectionIn,
+                            ctx: TenantContext = Depends(
+                                require("dashboard:create")),
+                            session=Depends(get_session)):
+    """R16: shared collections — named dashboard sets for the whole
+    tenant (curated entry points: 'Board pack', 'Ops weekly')."""
+    import copy as _copy
+
+    from ..models import Tenant
+
+    for did in body.dashboard_ids:
+        if (await session.execute(select(Dashboard).where(
+                Dashboard.id == _uuid_or_422(did, "dashboard_ids"),
+                Dashboard.tenant_id == ctx.tenant_id))
+                ).scalar_one_or_none() is None:
+            raise HTTPException(422, f"Dashboard {did} not found")
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    feats = _copy.deepcopy(t.features or {})
+    colls = feats.setdefault("collections", [])
+    colls[:] = [c for c in colls if c["name"] != body.name][:19]
+    colls.append({"name": body.name, "dashboard_ids": body.dashboard_ids,
+                  "created_by": str(ctx.user_id)})
+    t.features = feats
+    await session.commit()
+    return {"collections": colls}
+
+
+@router.get("/collections")
+async def list_collections(ctx: TenantContext = Depends(
+        require("dashboard:read")),
+        session=Depends(get_session)):
+    from ..models import Tenant
+
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    return {"collections": (t.features or {}).get("collections", [])}

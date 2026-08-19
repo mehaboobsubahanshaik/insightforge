@@ -152,6 +152,18 @@ async def run_due_reports_once() -> int:
                 hydrated = await _hydrate(s, tenant_id, v.widgets, [])
                 hydrated["name"] = d.name
                 pdf = render_dashboard_pdf(hydrated)
+                # R16: scheduled snapshot artifact alongside the report
+                import json as _json
+                import os as _os
+
+                outdir = _os.environ.get("OUTBOX_DIR", "/srv/outbox")
+                _os.makedirs(outdir, exist_ok=True)
+                snap_name = (f"snapshot-{d.id}-"
+                             f"{now.strftime('%Y%m%dT%H%M%S')}.json")
+                with open(_os.path.join(outdir, snap_name), "w") as fh:
+                    _json.dump({"dashboard": d.name, "scheduled": True,
+                                "taken_at": now.isoformat(),
+                                **hydrated}, fh, default=str)
                 ds_by_id = {}
                 for w in v.widgets:
                     if w["dataset_id"] not in ds_by_id:

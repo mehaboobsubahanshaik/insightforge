@@ -333,6 +333,7 @@ class Comment(Base):
     parent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     body: Mapped[str] = mapped_column(Text)
     mentions: Mapped[list] = mapped_column(JSONB, default=list)
+    widget_anchor: Mapped[int | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = _now()
 
 
