@@ -1,6 +1,15 @@
 # Gap Register — repo vs. master product prompt
 
-## Bucket A: being closed in-repo (R1–R6 completion arc)
+## Bucket A — CLOSED through R14 (see COMPLETION-VERIFICATION.md)
+R1–R14 delivered: security, connectors framework, LLM abstraction, exports,
+semantics, roles, alert lifecycle, viz types, interactions, identity, ops,
+docs. Remaining Bucket-A items (small, tracked in PRODUCT-BACKLOG.md):
+geo/cohort/bullet/control renderers, custom visuals, dashboard annotations,
+snapshot-in-scheduler wiring, reference-data mapping, per-key API usage
+report, threaded comments/collections, Parquet (needs pyarrow dep decision),
+GraphQL source, webhooks-as-source, dead-letter runs, enrichment.
+
+## (superseded) original Bucket A plan
 R1 security completion (this phase) · R2 connector framework (generic
 REST/JSON/Sheets-CSV) · R3 LLM provider abstraction (env-keyed, deterministic
 fallback, redaction + cost tracking) · R4 viz breadth + Excel/print export +
