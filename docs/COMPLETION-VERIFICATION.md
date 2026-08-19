@@ -1,6 +1,6 @@
 # Completion Arc Verification (R1–R6)
 
-Date: 2026-08-18 · Branch: suhan · Suite: 153 tests · Migrations: 0001–0016 · Migrations: 0001–0015
+Date: 2026-08-18 · Branch: suhan · Suite: 158 tests · Migrations: 0001–0016 · Migrations: 0001–0015
 
 | Phase | Delivered | Evidence |
 |---|---|---|
@@ -16,6 +16,10 @@ Date: 2026-08-18 · Branch: suhan · Suite: 153 tests · Migrations: 0001–0016
 | R11 | semantic model, virtual joins, metric versioning+units+validation | test_r11_semantic |
 | R12 | JIT, break-glass, gated impersonation, session revocation, XML (defusedxml) | test_r12_identity |
 | R13 | legal hold, flags, cost report, credential rotation, drift report, outlier advisory | test_r13_ops |
+| R15 | 12 industry packs (honest apply), churn/lead scoring (labeled heuristic) | test_r15_packs |
+| R16 | annotations, collections, scheduled snapshot wiring, bullet + control (XmR) — threaded comments & PDF reports found pre-existing | test_r16_collab_viz |
+| R17 | passwordless magic-link (single-use, no enumeration), per-key usage, Parquet, k6 suite | test_r17_platform |
+| R18 | formal deliverables: DoR/DoD + increment template, 5 subsystem diagrams + component diagram, AsyncAPI spec, MVP + segment matrices, workflow/UX specs, connector priority matrix | this doc |
 | R14 | full docs suite (matrix, backlog, catalogs, FMEA, capacity, observability, release notes) | this doc |
 | R6 | 9-role catalog with scoped permissions, alert ack/quiet-hours/escalation (once-only), data-issue reporting into approvals | test_r6_completion |
 

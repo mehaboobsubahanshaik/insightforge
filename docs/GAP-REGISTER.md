@@ -4,10 +4,11 @@
 R1–R14 delivered: security, connectors framework, LLM abstraction, exports,
 semantics, roles, alert lifecycle, viz types, interactions, identity, ops,
 docs. Remaining Bucket-A items (small, tracked in PRODUCT-BACKLOG.md):
-geo/cohort/bullet/control renderers, custom visuals, dashboard annotations,
-snapshot-in-scheduler wiring, reference-data mapping, per-key API usage
-report, threaded comments/collections, Parquet (needs pyarrow dep decision),
-GraphQL source, webhooks-as-source, dead-letter runs, enrichment.
+geo + cohort renderers, custom visuals, reference-data mapping, GraphQL
+source, webhooks-as-source (append-ingest design), formal dead-letter queue,
+service-account creation flow, enrichment. (bullet/control/annotations/
+collections/snapshots/per-key-usage/Parquet/passwordless closed R15-R17;
+threaded comments + PDF reports discovered pre-existing.)
 
 ## (superseded) original Bucket A plan
 R1 security completion (this phase) · R2 connector framework (generic

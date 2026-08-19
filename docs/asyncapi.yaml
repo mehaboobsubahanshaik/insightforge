@@ -1,0 +1,47 @@
+asyncapi: 2.6.0
+info:
+  title: InsightForge Events
+  version: 1.0.0
+  description: >
+    Outbound webhook events. Every delivery is signed:
+    X-IF-Signature: hex(hmac_sha256(secret, raw_body)).
+defaultContentType: application/json
+channels:
+  alert.triggered:
+    subscribe:
+      message:
+        payload:
+          type: object
+          properties:
+            message: {type: string}
+            dataset_id: {type: string, format: uuid}
+            kind: {type: string, enum: [threshold, relative, anomaly,
+                                        forecast, dataset_health]}
+  anomaly.detected:
+    subscribe: {message: {payload: {type: object}}}
+  sync.failed:
+    subscribe:
+      message:
+        payload:
+          type: object
+          properties:
+            connection_id: {type: string}
+            error: {type: string}
+  report.sent:
+    subscribe: {message: {payload: {type: object}}}
+  forecast.breach:
+    subscribe: {message: {payload: {type: object}}}
+  siem.audit:
+    subscribe:
+      message:
+        payload:
+          type: object
+          properties:
+            events:
+              type: array
+              items:
+                type: object
+                properties:
+                  action: {type: string}
+                  actor_user_id: {type: string}
+                  created_at: {type: string, format: date-time}
