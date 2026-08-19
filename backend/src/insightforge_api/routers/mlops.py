@@ -452,3 +452,81 @@ async def model_governance(ctx: TenantContext = Depends(require("usage:read")),
                          "eval suite in CI (docs/AI-EVALS.md)",
                          "drift monitoring on forecast models",
                          "external/private models default high risk"]}
+
+
+class ScoreIn(BaseModel):
+    dataset_id: str
+    kind: str = Field(pattern="^(churn|lead)$")
+    entity_column: str
+    recency_column: str          # date column
+    value_column: str            # numeric column
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@router.post("/models/score")
+async def heuristic_score(body: ScoreIn,
+                          ctx: TenantContext = Depends(require("dataset:read")),
+                          session=Depends(get_session)):
+    """R15: deterministic churn/lead scoring — an HONEST recency+value
+    heuristic (RFM-style), 0-100 with the arithmetic shown. Labeled a
+    baseline: training a real model needs labeled outcomes (registry is
+    ready for that day)."""
+    from sqlalchemy import text as _t
+
+    ds = (await session.execute(select(Dataset).where(
+        Dataset.id == body.dataset_id,
+        Dataset.tenant_id == ctx.tenant_id))).scalar_one_or_none()
+    if ds is None:
+        raise HTTPException(404, "Dataset not found")
+    cols = {c["name"]: c["inferred_type"] for c in ds.schema_def}
+    if cols.get(body.recency_column) not in ("date", "timestamp"):
+        raise HTTPException(422, "recency_column must be a date column")
+    if cols.get(body.value_column) not in ("number", "integer"):
+        raise HTTPException(422, "value_column must be numeric")
+    if body.entity_column not in cols:
+        raise HTTPException(422, "entity_column not on dataset")
+    rows = (await session.execute(_t(
+        "SELECT data->>:e AS ent, "
+        "max((data->>:r)::date) AS last_seen, "
+        "sum((data->>:v)::numeric) AS value, count(*) AS freq "
+        "FROM dataset_rows WHERE dataset_id = :d AND import_id = :i "
+        "AND NOT is_quarantined AND data->>:r IS NOT NULL "
+        "GROUP BY 1 ORDER BY 3 DESC LIMIT :n"),
+        {"e": body.entity_column, "r": body.recency_column,
+         "v": body.value_column, "d": str(ds.id),
+         "i": str(ds.current_import_id), "n": body.limit})).all()
+    if not rows:
+        raise HTTPException(422, "No scorable rows")
+    from datetime import date as _date
+
+    today = _date.today()
+    max_val = max(float(r.value or 0) for r in rows) or 1.0
+    max_freq = max(int(r.freq) for r in rows) or 1
+    out = []
+    for r in rows:
+        days = (today - r.last_seen).days
+        recency = max(0.0, 1 - days / 365)          # 0..1, stale -> 0
+        value = float(r.value or 0) / max_val       # 0..1
+        freq = int(r.freq) / max_freq               # 0..1
+        if body.kind == "churn":
+            score = round(100 * (1 - (0.6 * recency + 0.2 * freq
+                                      + 0.2 * value)), 1)
+            meaning = "higher = more likely to churn (staleness-driven)"
+        else:
+            score = round(100 * (0.5 * value + 0.3 * recency
+                                 + 0.2 * freq), 1)
+            meaning = "higher = warmer lead (value+recency-driven)"
+        out.append({"entity": r.ent, "score": score,
+                    "days_since_last": days,
+                    "total_value": float(r.value or 0),
+                    "events": int(r.freq)})
+    out.sort(key=lambda x: -x["score"])
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="ml.score",
+                       resource_type="dataset", resource_id=str(ds.id),
+                       detail={"kind": body.kind, "entities": len(out)})
+    await session.commit()
+    return {"kind": body.kind, "meaning": meaning,
+            "method": "deterministic RFM heuristic — baseline, not a "
+                      "trained model; wire labeled outcomes for ML",
+            "scores": out}
