@@ -1043,6 +1043,49 @@ async def report_data_issue(dataset_id: str, body: IssueIn,
             "note": "Visible in the approvals queue (kind: data_issue)."}
 
 
+@router.post("/upload-parquet", status_code=201)
+async def upload_parquet(request: Request, file: UploadFile,
+                         workspace_id: str = Query(...),
+                         name: str = Query(..., min_length=1,
+                                           max_length=255),
+                         ctx: TenantContext = Depends(
+                             require("dataset:create")),
+                         session=Depends(get_session)):
+    """R17: Parquet ingestion (pyarrow) -> the CSV trust pipeline."""
+    import io as _io
+
+    from starlette.datastructures import UploadFile as _SUF
+
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "Upload too large")
+    try:
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(_io.BytesIO(raw))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(422, f"Not readable Parquet: {e}") from None
+    if table.num_rows == 0:
+        raise HTTPException(422, "Parquet file has no rows")
+    import csv as _csv
+
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    cols = table.column_names
+    w.writerow(cols)
+    for batch in table.to_batches(max_chunksize=5000):
+        pydict = batch.to_pydict()
+        for row_i in range(batch.num_rows):
+            w.writerow(["" if pydict[c][row_i] is None
+                        else pydict[c][row_i] for c in cols])
+    return await upload(request=request,
+                        file=_SUF(filename=name + ".csv",
+                                  file=_io.BytesIO(
+                                      buf.getvalue().encode())),
+                        workspace_id=workspace_id, name=name,
+                        ctx=ctx, session=session)
+
+
 @router.post("/upload-xml", status_code=201)
 async def upload_xml(request: Request, file: UploadFile,
                      workspace_id: str = Query(...),

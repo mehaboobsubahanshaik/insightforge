@@ -507,3 +507,89 @@ async def revoke_session(session_id: str,
     rt.revoked = True
     await session.commit()
     return {"revoked": session_id}
+
+
+class MagicLinkIn(BaseModel):
+    email: EmailStr
+    tenant_slug: str
+
+
+@router.post("/magic-link")
+async def request_magic_link(body: MagicLinkIn, request: Request):
+    """R17 passwordless: emails a one-time 15-minute login link. Always
+    returns 200 (no member enumeration); the token is single-use via the
+    same hashed single-use store as refresh rotation."""
+    import hashlib as _hl
+    import secrets as _sec
+
+    from ..services import mailer
+
+    async with session_factory()() as session:
+        tenant = (await session.execute(select(Tenant).where(
+            Tenant.slug == body.tenant_slug))).scalar_one_or_none()
+    if tenant is None:
+        return {"status": "If that member exists, a sign-in link was sent."}
+    async with tenant_scoped_session(tenant.id) as session:
+        user = (await session.execute(
+            select(User).join(Membership, Membership.user_id == User.id)
+            .where(Membership.tenant_id == tenant.id,
+                   User.email == body.email.lower()))).scalar_one_or_none()
+        if user is not None:
+            raw = _sec.token_urlsafe(32)
+            session.add(RefreshToken(
+                user_id=user.id,
+                token_hash=_hl.sha256(f"magic:{raw}".encode()).hexdigest(),
+                expires_at=datetime.now(timezone.utc)
+                + timedelta(minutes=15)))
+            await mailer.send(
+                session, tenant_id=tenant.id, to_email=user.email,
+                kind="auth", subject="Your InsightForge sign-in link",
+                body=f"Sign in (15 min, single use): "
+                     f"magic-token={raw} tenant={tenant.slug}")
+            await audit.record(session, tenant_id=tenant.id,
+                               actor_user_id=user.id,
+                               action="auth.magic_link_sent",
+                               resource_type="user",
+                               resource_id=str(user.id))
+            await session.commit()
+    return {"status": "If that member exists, a sign-in link was sent."}
+
+
+class MagicLoginIn(BaseModel):
+    token: str
+    tenant_slug: str
+
+
+@router.post("/magic-login")
+async def magic_login(body: MagicLoginIn):
+    """Redeem the link — once."""
+    import hashlib as _hl
+
+    h = _hl.sha256(f"magic:{body.token}".encode()).hexdigest()
+    async with session_factory()() as session:
+        return await _magic_login_inner(session, h, body)
+
+
+async def _magic_login_inner(session, h, body):
+    rt = (await session.execute(select(RefreshToken).where(
+        RefreshToken.token_hash == h))).scalar_one_or_none()
+    if rt is None or rt.revoked or             rt.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(401, "Link invalid, expired, or already used")
+    rt.revoked = True  # single use
+    tenant = (await session.execute(select(Tenant).where(
+        Tenant.slug == body.tenant_slug))).scalar_one_or_none()
+    m = None
+    if tenant is not None:
+        m = (await session.execute(select(Membership).where(
+            Membership.tenant_id == tenant.id,
+            Membership.user_id == rt.user_id))).scalar_one_or_none()
+    if m is None:
+        raise HTTPException(401, "Link invalid for this organization")
+    user = (await session.execute(select(User).where(
+        User.id == rt.user_id))).scalar_one()
+    pair = await _issue_pair(session, user, tenant, m.role)
+    await audit.record(session, tenant_id=tenant.id,
+                       actor_user_id=m.user_id, action="auth.magic_login",
+                       resource_type="user", resource_id=str(m.user_id))
+    await session.commit()
+    return pair

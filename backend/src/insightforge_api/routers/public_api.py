@@ -141,7 +141,27 @@ async def public_query(dataset_id: str, body: QueryIn,
             raise HTTPException(422, str(e)) from None
         await audit.record(s, tenant_id=key.tenant_id, actor_user_id=None,
                            action="api.query", resource_type="dataset",
-                           resource_id=str(d.id))
+                           resource_id=str(d.id),
+                           detail={"api_key_id": str(key.id),
+                                   "key_name": key.name})
         await s.commit()
         return {"dataset": d.name, "formula": body.formula, **result,
                 "quality_score": d.quality_score}
+
+
+@router.get("/api-keys/usage")
+async def key_usage(ctx: TenantContext = Depends(require("usage:read")),
+                    session=Depends(get_session)):
+    """R17: API usage per key, month to date (from the audit trail)."""
+    from sqlalchemy import func as _f
+
+    from ..models import AuditEvent
+
+    expr = AuditEvent.detail["key_name"].astext.label("kname")
+    rows = (await session.execute(
+        select(expr, _f.count())
+        .where(AuditEvent.tenant_id == ctx.tenant_id,
+               AuditEvent.action == "api.query",
+               AuditEvent.created_at >= _f.date_trunc("month", _f.now()))
+        .group_by("kname"))).all()
+    return {"month_to_date": {(k or "unknown"): int(c) for k, c in rows}}
