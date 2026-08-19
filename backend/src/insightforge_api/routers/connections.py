@@ -242,3 +242,34 @@ async def linked_dataset(connection_id: str,
     if ds is None:
         raise HTTPException(404, "No dataset yet — run a sync first")
     return {"dataset_id": str(ds.id), "name": ds.name}
+
+
+class RotateIn(BaseModel):
+    credentials: dict = Field(min_length=1)
+
+
+@router.post("/{connection_id}/rotate-credentials")
+async def rotate_credentials(connection_id: str, body: RotateIn,
+                             ctx: TenantContext = Depends(
+                                 require("connection:manage")),
+                             session=Depends(get_session)):
+    """R13: replace vaulted credentials — verified against the source
+    BEFORE storing (a bad rotation cannot brick the connection), audited."""
+    conn = (await session.execute(select(Connection).where(
+        Connection.id == connection_id,
+        Connection.tenant_id == ctx.tenant_id))).scalar_one_or_none()
+    if conn is None:
+        raise HTTPException(404, "Connection not found")
+    try:
+        await REGISTRY[conn.connector_type].test_connection(
+            conn.config, body.credentials)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(422, f"New credentials failed verification: "
+                                 f"{e}") from None
+    conn.credentials_enc = encrypt_credentials(body.credentials)
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="connection.rotate",
+                       resource_type="connection", resource_id=str(conn.id))
+    await session.commit()
+    return {"rotated": str(conn.id),
+            "note": "Old credentials are gone; next sync uses the new ones."}

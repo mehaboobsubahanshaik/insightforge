@@ -508,3 +508,84 @@ async def impersonate(user_id: str,
     return {"access_token": token, "acting_as": user_id,
             "capped_role": "viewer",
             "note": "Impersonation is viewer-capped and dual-audited."}
+
+
+class LegalHoldIn(BaseModel):
+    enabled: bool
+    reason: str = Field(default="", max_length=500)
+
+
+@router.put("/legal-hold")
+async def set_legal_hold(body: LegalHoldIn,
+                         ctx: TenantContext = Depends(require("tenant:manage")),
+                         session=Depends(get_session)):
+    """R13: legal hold — while enabled, retention purges and offboard
+    deletion are suspended for this tenant. Enabling requires a reason."""
+    if body.enabled and len(body.reason.strip()) < 10:
+        raise HTTPException(422, "A legal hold needs a substantive reason")
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    t.features = {**(t.features or {}),
+                  "legal_hold": {"enabled": body.enabled,
+                                 "reason": body.reason,
+                                 "set_at": datetime.now(
+                                     timezone.utc).isoformat()}}
+    await audit.record(session, tenant_id=ctx.tenant_id,
+                       actor_user_id=ctx.user_id, action="legal_hold.set",
+                       resource_type="tenant", resource_id=str(t.id),
+                       detail={"enabled": body.enabled})
+    await session.commit()
+    return {"legal_hold": t.features["legal_hold"]}
+
+
+PLATFORM_FLAGS = {"ai_summaries": True, "embed_edit_tokens": True,
+                  "new_viz_types": True, "voice_ask": True,
+                  "partner_console": True}
+
+
+class FlagIn(BaseModel):
+    flag: str
+    enabled: bool
+
+
+@router.put("/flags")
+async def set_flag(body: FlagIn,
+                   ctx: TenantContext = Depends(require("tenant:manage")),
+                   session=Depends(get_session)):
+    """R13: tenant-level feature flags over platform defaults."""
+    if body.flag not in PLATFORM_FLAGS:
+        raise HTTPException(422, f"Unknown flag; known: "
+                                 f"{sorted(PLATFORM_FLAGS)}")
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    flags = {**(t.features or {}).get("flags", {}), body.flag: body.enabled}
+    t.features = {**(t.features or {}), "flags": flags}
+    await session.commit()
+    return {"flags": {**PLATFORM_FLAGS, **flags}}
+
+
+@router.get("/flags")
+async def get_flags(ctx: TenantContext = Depends(require("dashboard:read")),
+                    session=Depends(get_session)):
+    t = (await session.execute(select(Tenant).where(
+        Tenant.id == ctx.tenant_id))).scalar_one()
+    return {"flags": {**PLATFORM_FLAGS,
+                      **((t.features or {}).get("flags", {}))}}
+
+
+@router.get("/cost-report")
+async def cost_report(ctx: TenantContext = Depends(require("usage:read")),
+                      session=Depends(get_session)):
+    """R13: cost allocation — this month's metered usage by kind."""
+    from sqlalchemy import func as _f
+
+    from ..models import BillingEvent
+
+    rows = (await session.execute(
+        select(BillingEvent.kind, _f.count()).where(
+            BillingEvent.tenant_id == ctx.tenant_id,
+            BillingEvent.created_at >= _f.date_trunc("month", _f.now()))
+        .group_by(BillingEvent.kind))).all()
+    return {"month_to_date": {k: int(c) for k, c in rows},
+            "note": "kinds map to invoice usage lines (embed.view, "
+                    "ai.question, ai.tokens, ...)"}

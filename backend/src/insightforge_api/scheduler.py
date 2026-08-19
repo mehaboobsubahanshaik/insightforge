@@ -447,11 +447,18 @@ async def run_lifecycle_once() -> int:
         # advanced retention (G2): purge rows past each dataset's window
         from .models import Dataset as _DS
 
+        held = {t.id for t in (await s.execute(select(Tenant))).scalars()
+                if ((t.features or {}).get("legal_hold") or {}).get(
+                    "enabled")}
         rds = (await s.execute(select(_DS).where(
             _DS.governance.isnot(None)))).scalars().all()
         for ds in rds:
             ret = (ds.governance or {}).get("retention")
             if not ret:
+                continue
+            if ds.tenant_id in held:
+                log.info("legal hold: skipping retention purge for %s",
+                         ds.name)
                 continue
             async with tenant_scoped_session(ds.tenant_id) as ts:
                 res = await ts.execute(_text(
@@ -467,6 +474,9 @@ async def run_lifecycle_once() -> int:
             Tenant.status == "offboarding",
             Tenant.deletion_due_at.is_not(None),
             Tenant.deletion_due_at < now))).scalars().all()
+        due = [t for t in due
+               if not ((t.features or {}).get("legal_hold") or {}).get(
+                   "enabled")]
         for t in due:
             async with tenant_scoped_session(t.id) as ts:
                 for table in ("dataset_rows", "dq_results", "dq_history",

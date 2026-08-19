@@ -102,6 +102,40 @@ async def suggest(session, ds) -> list[dict]:
                     "severity": 90 + r.n})
 
     # dedupe (same op+column suggested twice keeps the stronger evidence)
+    # R13 advisory: numeric outliers (|z| > 3) via live SQL stats —
+    # flagged for review, never auto-removed.
+    from sqlalchemy import text as _t
+
+    for col in ds.schema_def:
+        if col["inferred_type"] not in ("number", "integer"):
+            continue
+        row = (await session.execute(_t(
+            "SELECT avg((data->>:c)::numeric), "
+            "stddev_samp((data->>:c)::numeric) FROM dataset_rows "
+            "WHERE dataset_id = :d AND import_id = :i "
+            "AND NOT is_quarantined AND data->>:c IS NOT NULL"),
+            {"c": col["name"], "d": str(ds.id),
+             "i": str(ds.current_import_id)})).one()
+        mean, std = row
+        if mean is None or not std:
+            continue
+        n = (await session.execute(_t(
+            "SELECT count(*) FROM dataset_rows WHERE dataset_id = :d "
+            "AND import_id = :i AND NOT is_quarantined "
+            "AND data->>:c IS NOT NULL "
+            "AND abs(((data->>:c)::numeric - :m) / :s) > 3"),
+            {"d": str(ds.id), "i": str(ds.current_import_id),
+             "c": col["name"], "m": float(mean),
+             "s": float(std)})).scalar_one()
+        if n:
+            out.append({"op": "review_outliers", "column": col["name"],
+                        "advisory": True, "severity": 1,
+                        "reason": f"{n} value(s) beyond 3 standard "
+                                  f"deviations (mean {float(mean):,.1f}, "
+                                  f"std {float(std):,.1f})",
+                        "effect": "review flagged rows — outliers are "
+                                  "never auto-removed"})
+
     seen: dict[tuple, dict] = {}
     for sug in out:
         key = (sug["op"], sug["column"])

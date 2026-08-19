@@ -969,6 +969,7 @@ class AlertLifecycleIn(BaseModel):
                                   pattern="^([01]\\d|2[0-3]):[0-5]\\d$")
     escalate_after_minutes: int | None = Field(default=None, ge=5, le=1440)
     escalate_to: str | None = None
+    owner_email: str | None = Field(default=None, max_length=320)
 
 
 @router.put("/{dataset_id}/alerts/{rule_id}/lifecycle")
@@ -1090,6 +1091,60 @@ async def upload_xml(request: Request, file: UploadFile,
                                       buf.getvalue().encode())),
                         workspace_id=workspace_id, name=name,
                         ctx=ctx, session=session)
+
+
+@router.get("/{dataset_id}/drift-report")
+async def drift_report(dataset_id: str,
+                       ctx: TenantContext = Depends(require("dataset:read")),
+                       session=Depends(get_session)):
+    """R13 schema-drift damage report: everything that references columns
+    this dataset no longer has — measures, governance policies, semantic
+    hierarchies. Run after any source schema change."""
+    from ..models import Measure
+    from ..models import Tenant as _T
+
+    ds = await _dataset_or_404(session, ctx, dataset_id)
+    cols = {c["name"] for c in ds.schema_def}
+    findings = []
+    measures = (await session.execute(select(Measure).where(
+        Measure.dataset_id == ds.id))).scalars().all()
+    import re as _re
+
+    for m in measures:
+        refs = set(_re.findall(r"[a-z_][a-z0-9_]*", m.formula)) - {
+            "sum", "count", "avg", "min", "max"}
+        missing = refs & set() | {r for r in refs if r not in cols
+                                  and not r.isdigit()}
+        if missing:
+            findings.append({"kind": "measure", "name": m.name,
+                             "missing_columns": sorted(missing)})
+    gov = ds.governance or {}
+    for section in ("classification", "column_policy"):
+        for colname in (gov.get(section) or {}):
+            if colname not in cols:
+                findings.append({"kind": f"governance.{section}",
+                                 "name": colname,
+                                 "missing_columns": [colname]})
+    ret = gov.get("retention")
+    if ret and ret.get("column") not in cols:
+        findings.append({"kind": "governance.retention",
+                         "name": ret.get("column"),
+                         "missing_columns": [ret.get("column")]})
+    t = (await session.execute(select(_T).where(
+        _T.id == ctx.tenant_id))).scalar_one()
+    sem = ((t.features or {}).get("semantic_model") or {})
+    for h in sem.get("hierarchies", []):
+        if h["dataset_id"] == str(ds.id):
+            miss = [c for c in h["levels"] if c not in cols]
+            if miss:
+                findings.append({"kind": "semantic.hierarchy",
+                                 "name": h["name"],
+                                 "missing_columns": miss})
+    return {"dataset": ds.name, "drifted": bool(findings),
+            "findings": findings,
+            "verdict": "schema drift is breaking references — fix before "
+                       "trusting dependent objects" if findings
+            else "no dangling references"}
 
 
 @router.post("/{dataset_id}/pii-scan")
